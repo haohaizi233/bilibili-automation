@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">WebView Automation</string>
+    <string name="tab_home">Home</string>
+    <string name="tab_accounts">Accounts</string>
+    <string name="tab_targets">Targets</string>
+    <string name="tab_task">Task</string>
+    <string name="tab_logs">Logs</string>
+    <string name="tab_settings">Settings</string>
+    <string name="notification_channel">Automation</string>
+</resources>

@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/bg"
+    android:orientation="vertical">
+
+    <EditText
+        android:id="@+id/urlInput"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/panel"
+        android:hint="file:///android_asset/test.html"
+        android:imeOptions="actionGo"
+        android:inputType="textUri"
+        android:padding="10dp"
+        android:singleLine="true"
+        android:textColor="@color/text"
+        android:textColorHint="#888888"
+        android:textSize="13sp" />
+
+    <HorizontalScrollView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/panel">
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:padding="4dp">
+
+            <Button android:id="@+id/btnGo" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Go" />
+            <Button android:id="@+id/btnTestJs" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Test JS" />
+            <Button android:id="@+id/btnInspect" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Inspect" />
+            <Button android:id="@+id/btnRunTest" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Run Automation Test" />
+            <Button android:id="@+id/btnStartWorkflow" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Start Mock WF" />
+            <Button android:id="@+id/btnPause" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Pause" />
+            <Button android:id="@+id/btnStop" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Stop" />
+        </LinearLayout>
+    </HorizontalScrollView>
+
+    <HorizontalScrollView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="#191919">
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Button android:id="@+id/tabHome" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/tab_home" />
+            <Button android:id="@+id/tabAccounts" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/tab_accounts" />
+            <Button android:id="@+id/tabTargets" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/tab_targets" />
+            <Button android:id="@+id/tabTask" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/tab_task" />
+            <Button android:id="@+id/tabLogs" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/tab_logs" />
+            <Button android:id="@+id/tabSettings" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/tab_settings" />
+        </LinearLayout>
+    </HorizontalScrollView>
+
+    <TextView
+        android:id="@+id/debugInfo"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="#222222"
+        android:fontFamily="monospace"
+        android:padding="6dp"
+        android:text="debug"
+        android:textColor="@color/accent"
+        android:textSize="11sp" />
+
+    <TextView
+        android:id="@+id/panelContent"
+        android:layout_width="match_parent"
+        android:layout_height="88dp"
+        android:background="@color/panel"
+        android:fontFamily="monospace"
+        android:padding="8dp"
+        android:text="Home"
+        android:textColor="@color/text"
+        android:textIsSelectable="true"
+        android:textSize="11sp" />
+
+    <LinearLayout
+        android:id="@+id/editorRow"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:padding="4dp">
+
+        <EditText
+            android:id="@+id/uidInput"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:hint="uid"
+            android:textColor="@color/text"
+            android:textColorHint="#888888"
+            android:textSize="12sp" />
+
+        <EditText
+            android:id="@+id/nameInput"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:hint="name"
+            android:textColor="@color/text"
+            android:textColorHint="#888888"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btnAddEntity"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Add" />
+    </LinearLayout>
+
+    <FrameLayout
+        android:id="@+id/browserContainer"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/panel"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:padding="6dp"
+            android:text="Automation Log"
+            android:textColor="@color/accent"
+            android:textSize="12sp" />
+
+        <Button android:id="@+id/filterAll" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="全部" />
+        <Button android:id="@+id/filterInfo" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="信息" />
+        <Button android:id="@+id/filterSuccess" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="成功" />
+        <Button android:id="@+id/filterWarn" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="警告" />
+        <Button android:id="@+id/filterError" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="错误" />
+    </LinearLayout>
+
+    <ScrollView
+        android:id="@+id/logScroll"
+        android:layout_width="match_parent"
+        android:layout_height="160dp"
+        android:background="#0D0D0D">
+
+        <TextView
+            android:id="@+id/logView"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:padding="8dp"
+            android:textColor="@color/text"
+            android:textIsSelectable="true"
+            android:textSize="11sp" />
+    </ScrollView>
+</LinearLayout>

@@ -1,0 +1,869 @@
+"""提供线程安全的调试日志、敏感信息脱敏与 trace_id 生成。"""
+
+import json
+import multiprocessing
+import re
+import threading
+import time
+import uuid
+from datetime import datetime
+from functools import wraps
+from typing import Any
+
+from app.utils.runtime_paths import user_logs_root
+
+_TRACE_PREFIX_ALIASES = {
+    "douyin": "dy",
+    "dy": "dy",
+    "bilibili": "bilibili",
+    "bili": "bilibili",
+    "kuaishou": "ks",
+    "ks": "ks",
+    "xiaohongshu": "xhs",
+    "xhs": "xhs",
+    "missav": "missav",
+    "miss": "missav",
+}
+_VALID_RETENTION_DAYS = {1, 3, 5, 7}
+_DEFAULT_RETENTION_DAYS = 1
+_MAX_DIAGNOSTIC_TEXT_LENGTH = 8_192
+_DIAGNOSTIC_TRUNCATION_MARKER = "...[truncated]"
+_DIAGNOSTIC_HTTP_URL = re.compile(
+    r"https?(?:://|:\\/\\/)[^\s，。；：！？）》】、]+",
+    flags=re.IGNORECASE,
+)
+_DIAGNOSTIC_URL_PREFIX = re.compile(
+    r"[a-z][a-z0-9+.-]{0,31}\s*:\s*(?:[\\/]\s*)+",
+    flags=re.IGNORECASE,
+)
+_TRUNCATED_URL_AUTHORITY = re.compile(
+    r"(?P<prefix>[a-z][a-z0-9+.-]{0,31}\s*:\s*(?:[\\/]\s*)+)"
+    r"[^\s/\\?#]+$",
+    flags=re.IGNORECASE,
+)
+_URL_TRAILING_PUNCTUATION = ".,;:!?)]}，。；：！？）》】"
+
+
+def _without_url_query_and_fragment(value: str) -> str:
+    boundaries = [index for marker in ("?", "#") if (index := value.find(marker)) >= 0]
+    return value[: min(boundaries)] if boundaries else value
+
+
+def _strip_url_query_and_fragment(match: re.Match[str]) -> str:
+    """Keep a useful URL location without persisting opaque CDN capabilities."""
+
+    matched = match.group(0)
+    candidate = matched.rstrip(_URL_TRAILING_PUNCTUATION)
+    trailing = matched[len(candidate) :]
+    redacted = _without_url_query_and_fragment(candidate)
+    if redacted == candidate:
+        return matched
+    return redacted + trailing
+
+
+def _strip_complete_url_query_and_fragment(value: str) -> str:
+    """Handle a complete URL value, including Unicode host and path text."""
+
+    candidate = value.strip()
+    if any(character.isspace() for character in candidate):
+        return value
+    if not re.match(r"^https?://", candidate, flags=re.IGNORECASE):
+        return value
+    redacted = _without_url_query_and_fragment(candidate)
+    if redacted == candidate:
+        return value
+    leading = value[: len(value) - len(value.lstrip())]
+    trailing = value[len(value.rstrip()) :]
+    return leading + redacted + trailing
+
+
+def _find_malformed_http_prefix(
+    value: str,
+    search_from: int,
+) -> tuple[int, int] | None:
+    """Find one broken/escaped HTTP prefix without regex backtracking."""
+
+    candidate = search_from
+    last_candidate = len(value) - 4
+    while candidate <= last_candidate:
+        if value[candidate : candidate + 4].lower() != "http":
+            candidate += 1
+            continue
+        cursor = candidate + 4
+        if cursor < len(value) and value[cursor] in "sS":
+            cursor += 1
+        while cursor < len(value) and value[cursor].isspace():
+            cursor += 1
+        if cursor >= len(value) or value[cursor] != ":":
+            candidate += 1
+            continue
+        cursor += 1
+        while cursor < len(value) and value[cursor].isspace():
+            cursor += 1
+        slash_count = 0
+        while cursor < len(value) and value[cursor] in "/\\":
+            slash_count += 1
+            cursor += 1
+            while cursor < len(value) and value[cursor].isspace():
+                cursor += 1
+        if slash_count:
+            return candidate, cursor
+        candidate += 1
+    return None
+
+
+def _strip_suspected_url_capabilities(value: str) -> str:
+    """Strip secrets from malformed URLs in one bounded linear scan."""
+
+    pieces: list[str] = []
+    output_cursor = 0
+    search_from = 0
+    while prefix := _find_malformed_http_prefix(value, search_from):
+        _, prefix_end = prefix
+        scan = prefix_end
+        marker = -1
+        while scan < len(value):
+            character = value[scan]
+            if character in "?#":
+                marker = scan
+                break
+            if character.isspace():
+                gap_end = scan + 1
+                while gap_end < len(value) and value[gap_end].isspace():
+                    gap_end += 1
+                if gap_end < len(value) and value[gap_end] in "?#":
+                    marker = gap_end
+                break
+            scan += 1
+
+        base_end = marker
+        while base_end > prefix_end and value[base_end - 1].isspace():
+            base_end -= 1
+        if marker >= 0 and base_end > prefix_end:
+            capability_end = marker + 1
+            while capability_end < len(value):
+                character = value[capability_end]
+                if character.isspace():
+                    break
+                capability_end += 1
+            pieces.append(value[output_cursor:base_end])
+            output_cursor = capability_end
+            search_from = capability_end
+            continue
+
+        if scan >= len(value):
+            break
+        search_from = max(prefix_end, scan + 1)
+
+    if not pieces:
+        return value
+    pieces.append(value[output_cursor:])
+    return "".join(pieces)
+
+
+def _mask_url_userinfo(value: str) -> str:
+    """Mask through the final authority `@` for complete or escaped URLs."""
+
+    pieces: list[str] = []
+    cursor = 0
+    search_from = 0
+    while match := _DIAGNOSTIC_URL_PREFIX.search(value, search_from):
+        authority_start = match.end()
+        authority_end = authority_start
+        while authority_end < len(value):
+            character = value[authority_end]
+            if character.isspace() or character in "/\\?#":
+                break
+            authority_end += 1
+        authority = value[authority_start:authority_end]
+        separator = authority.rfind("@")
+        if separator >= 0:
+            pieces.extend(
+                (
+                    value[cursor:authority_start],
+                    "***:***@",
+                    authority[separator + 1 :],
+                )
+            )
+            cursor = authority_end
+        search_from = max(match.end(), authority_end)
+    if not pieces:
+        return value
+    pieces.append(value[cursor:])
+    return "".join(pieces)
+
+
+def _best_effort_diagnostic(method):
+    """Keep diagnostic failures from replacing the caller's primary outcome."""
+
+    @wraps(method)
+    def guarded(*args, **kwargs):
+        try:
+            return method(*args, **kwargs)
+        except BaseException:
+            return None
+
+    return guarded
+
+
+def normalize_trace_prefix(prefix: str = "trace") -> str:
+    """把前端追踪前缀规整为稳定的 platform_name 片段。"""
+    raw = str(prefix or "trace").strip() or "trace"
+    raw = re.sub(r"[^0-9A-Za-z_-]+", "_", raw).replace("-", "_").strip("_")
+    parts = [part for part in raw.split("_") if part]
+    if not parts:
+        return "trace"
+    base = _TRACE_PREFIX_ALIASES.get(parts[0].lower(), parts[0].lower())
+    tail: list[str] = []
+    for part in parts[1:]:
+        normalized = _TRACE_PREFIX_ALIASES.get(part.lower(), part)
+        if not tail and str(normalized).lower() == base.lower():
+            continue
+        tail.append(str(normalized))
+    return "_".join([base, *tail])
+
+class DebugLogger:
+    """以便于排障的文本格式记录日志，并在写入前统一脱敏。"""
+
+    SENSITIVE_KEYS = {
+        "cookie",
+        "cookies",
+        "cookie_str",
+        "authorization",
+        "access_token",
+        "refresh_token",
+        "token",
+        "sessionid",
+        "sessionid_ss",
+        "sessdata",
+        "password",
+        "secret",
+        "proxy_auth",
+    }
+    LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40}
+
+    def __init__(self):
+        self.logs_dir = user_logs_root()
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        process_name = multiprocessing.current_process().name
+        # latest_debug.log 是主进程诊断入口；子进程只写独立会话，避免多进程争用同一文件。
+        self._is_main_process = (process_name == "MainProcess")
+        self.session_file = self.logs_dir / f"debug_{timestamp}_{process_name}.log"
+        self.latest_file = self.logs_dir / "latest_debug.log"
+        self.latest_error_summary_file = self.logs_dir / "latest_error_summary.md"
+        self._lock = threading.Lock()
+        self._min_level = self.LEVEL_ORDER["INFO"]
+        self._retention_days = _DEFAULT_RETENTION_DAYS
+        self._last_cleanup_policy: tuple[int, str] | None = None
+
+        # Windows 可能短暂持有日志文件锁，因此初始化也走有限重试的安全写入路径。
+        if self._is_main_process:
+            self._safe_write_text(self.latest_file, "")
+            self._safe_write_text(
+                self.latest_error_summary_file,
+                "# 最近错误摘要\n\n当前会话暂无错误。\n",
+            )
+        self._write_header()
+
+    def configure(
+        self,
+        *,
+        level: str | None = None,
+        retention_days: int | None = None,
+        cleanup_old_logs: bool | None = None,
+    ) -> None:
+        """应用 GUI 与 Web 共用的运行时日志设置。"""
+        if level is not None:
+            normalized_level = str(level or "info").strip().upper()
+            self._min_level = self.LEVEL_ORDER.get(normalized_level, self.LEVEL_ORDER["INFO"])
+        if retention_days is not None:
+            try:
+                days = int(retention_days)
+                self._retention_days = days if days in _VALID_RETENTION_DAYS else _DEFAULT_RETENTION_DAYS
+            except (TypeError, ValueError):
+                self._retention_days = _DEFAULT_RETENTION_DAYS
+        if cleanup_old_logs:
+            policy = (self._retention_days, datetime.now().strftime("%Y-%m-%d"))
+            if policy != self._last_cleanup_policy:
+                self.cleanup_old_logs(self._retention_days)
+                self._last_cleanup_policy = policy
+
+    def cleanup_old_logs(self, retention_days: int | None = None) -> int:
+        """清理过期调试会话，同时保留当前会话和最新诊断文件。"""
+        try:
+            raw_days = int(retention_days if retention_days is not None else self._retention_days)
+            days = raw_days if raw_days in _VALID_RETENTION_DAYS else _DEFAULT_RETENTION_DAYS
+        except (TypeError, ValueError):
+            days = _DEFAULT_RETENTION_DAYS
+        cutoff = time.time() - days * 24 * 60 * 60
+        keep_paths = {self.session_file.resolve(), self.latest_file.resolve(), self.latest_error_summary_file.resolve()}
+        removed = 0
+        for path in self.logs_dir.glob("debug_*.log"):
+            try:
+                resolved = path.resolve()
+                if resolved in keep_paths or path.stat().st_mtime >= cutoff:
+                    continue
+                path.unlink()
+                removed += 1
+            except OSError:
+                continue
+        return removed
+
+    def _should_write_level(self, level: str) -> bool:
+        normalized = str(level or "INFO").strip().upper()
+        return self.LEVEL_ORDER.get(normalized, self.LEVEL_ORDER["INFO"]) >= self._min_level
+
+    def _safe_write_text(self, path, content, encoding="utf-8"):
+        """容忍 Windows 短时文件锁；诊断日志写入失败不能中断主流程。"""
+        import time as _time
+        for attempt in range(3):
+            try:
+                path.write_text(content, encoding=encoding)
+                return True
+            except (OSError, PermissionError) as exc:
+                if attempt == 2:
+                    # 三次失败后只记录到标准 logger，避免调试设施反向影响采集任务。
+                    import logging
+                    logging.getLogger(__name__).debug(
+                        f"[debug_logger] 无法写入 {path.name}: {exc}"
+                    )
+                    return False
+                _time.sleep(0.05 * (attempt + 1))  # 采用 50/100/150 ms 递增退避。
+        return False
+
+    def _write_header(self):
+        header = [
+            "=" * 88,
+            "Universal Crawler Pro Debug Session",
+            f"Started At : {self._now()}",
+            f"Log File   : {self.session_file.name}",
+            "=" * 88,
+            "",
+        ]
+        self._append_lines(header)
+
+    def _now(self) -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _is_sensitive_key(self, key: str) -> bool:
+        lower_key = key.lower()
+        if lower_key.endswith(("_path", "_file", "_dir")):
+            return False
+        if lower_key in self.SENSITIVE_KEYS:
+            return True
+        return any(
+            marker in lower_key
+            for marker in ("authorization", "sessionid", "sessdata", "password", "secret", "token")
+        )
+
+    def _mask_inline_secret(self, value: str) -> str:
+        if len(value) > _MAX_DIAGNOSTIC_TEXT_LENGTH:
+            value = _TRUNCATED_URL_AUTHORITY.sub(
+                r"\g<prefix>[redacted]",
+                value[:_MAX_DIAGNOSTIC_TEXT_LENGTH],
+            ) + _DIAGNOSTIC_TRUNCATION_MARKER
+        masked = _mask_url_userinfo(value)
+        masked = _strip_suspected_url_capabilities(masked)
+        masked = _strip_complete_url_query_and_fragment(masked)
+        masked = _DIAGNOSTIC_HTTP_URL.sub(_strip_url_query_and_fragment, masked)
+        masked = re.sub(
+            r"([?&](?:token|access_token|refresh_token|sessionid(?:_ss)?|sessdata|mstoken|ttwid|authorization|cookie)=)[^&\s]+",
+            r"\1***",
+            masked,
+            flags=re.IGNORECASE,
+        )
+        masked = re.sub(
+            r"(\b(?:authorization|proxy-authorization|cookie|password|passwd|pwd|secret|token|access_token|refresh_token|sessionid(?:_ss)?|sessdata|mstoken|ttwid)\s*[:=]\s*)"
+            r"(?:bearer\s+)?(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+            r"\1[已脱敏]",
+            masked,
+            flags=re.IGNORECASE,
+        )
+        lowered = masked.lower()
+        if lowered.startswith("bearer "):
+            return "Bearer ***"
+        if lowered.startswith("cookie:"):
+            return "Cookie: [已脱敏]"
+        if lowered.startswith("authorization:"):
+            return "Authorization: [已脱敏]"
+        return masked
+
+    def _safe_diagnostic_text(
+        self,
+        value: Any,
+        *,
+        fallback: str = "[unprintable]",
+        single_line: bool = False,
+    ) -> str:
+        try:
+            raw = str(value)
+        except BaseException:
+            return fallback
+        if single_line:
+            raw = raw.replace("\n", " ").replace("\r", " ").strip()
+        try:
+            return self._mask_inline_secret(raw)
+        except BaseException:
+            return fallback
+
+    def _redact_command_args(self, command_args: list[str] | tuple[str, ...]) -> list[str]:
+        """同时脱敏参数内嵌密钥和敏感选项后的独立参数值。"""
+        sensitive_flags = {
+            "/p",
+            "--password",
+            "--passphrase",
+            "--token",
+            "--secret",
+            "--authorization",
+            "--cookie",
+        }
+        redacted: list[str] = []
+        mask_next = False
+        for item in command_args:
+            value = self._safe_diagnostic_text(item, single_line=True)
+            if mask_next:
+                redacted.append("[已脱敏]")
+                mask_next = False
+                continue
+            redacted.append(value)
+            if value.strip().lower() in sensitive_flags:
+                mask_next = True
+        return redacted
+
+    def _redact_sensitive_value(self, value: Any) -> Any:
+        if isinstance(value, str):
+            if re.match(
+                r"^\s*(?:cookie|password|passwd|pwd|secret|token|sessionid(?:_ss)?|sessdata|mstoken|ttwid)\s*[:=]",
+                value,
+                flags=re.IGNORECASE,
+            ):
+                return "[已脱敏]"
+            masked = self._mask_inline_secret(value)
+            return masked if masked != value else "[已脱敏]"
+        if isinstance(value, (dict, list, tuple, set)):
+            return "[已脱敏]"
+        return "***"
+
+    def _normalize_mapping_key(self, value: Any) -> str:
+        cleaned = self._safe_diagnostic_text(
+            value,
+            single_line=True,
+        )
+        if len(cleaned) > 220:
+            return cleaned[:217] + "..."
+        return cleaned
+
+    def _append_lines(self, lines: list[str]):
+        content = "\n".join(lines) + "\n"
+        import time as _time
+        with self._lock:
+            # 杀毒扫描或日志查看器仍可能短时锁住独立会话文件，有限重试后再降级。
+            for attempt in range(3):
+                try:
+                    with open(self.session_file, "a", encoding="utf-8") as fp:
+                        fp.write(content)
+                    break
+                except (OSError, PermissionError):
+                    if attempt == 2:
+                        # 会话文件不可写时只丢弃本批日志，不向业务调用方抛异常。
+                        return
+                    _time.sleep(0.05 * (attempt + 1))
+            # latest_debug.log 只反映主进程，避免 Web 子进程覆盖 GUI 的诊断上下文。
+            if self._is_main_process:
+                for attempt in range(3):
+                    try:
+                        with open(self.latest_file, "a", encoding="utf-8") as fp:
+                            fp.write(content)
+                        break
+                    except (OSError, PermissionError):
+                        if attempt == 2:
+                            return
+                        _time.sleep(0.05 * (attempt + 1))
+
+    def _clean_mapping(self, data: dict[str, Any] | None) -> dict[str, Any]:
+        if not data:
+            return {}
+        cleaned = {}
+        for key, value in data.items():
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            if isinstance(value, (list, tuple, set, dict)) and len(value) == 0:
+                continue
+            normalized_key = self._normalize_mapping_key(key)
+            if self._is_sensitive_key(normalized_key):
+                cleaned[normalized_key] = self._redact_sensitive_value(value)
+                continue
+            if isinstance(value, str):
+                cleaned[normalized_key] = self._mask_inline_secret(value)
+                continue
+            cleaned[normalized_key] = self._normalize_value(value)
+        return cleaned
+
+    def _format_mapping(self, title: str, data: dict[str, Any] | None) -> list[str]:
+        data = self._clean_mapping(data)
+        if not data:
+            return []
+        lines = [f"{title}:"]
+        for key, value in data.items():
+            normalized = self._normalize_value(value)
+            if isinstance(normalized, dict):
+                lines.append(f"  - {key}:")
+                for sub_key, sub_value in normalized.items():
+                    lines.append(f"      {sub_key}: {sub_value}")
+            elif isinstance(normalized, list):
+                lines.append(f"  - {key}: {', '.join(str(i) for i in normalized)}")
+            else:
+                lines.append(f"  - {key}: {normalized}")
+        return lines
+
+    def _normalize_value(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            result = {}
+            for key, item in list(value.items())[:20]:
+                normalized_key = self._normalize_mapping_key(key)
+                normalized = (
+                    self._redact_sensitive_value(item)
+                    if self._is_sensitive_key(normalized_key)
+                    else self._normalize_value(item)
+                )
+                if normalized in (None, "", [], {}):
+                    continue
+                result[normalized_key] = normalized
+            return result
+        if isinstance(value, (list, tuple, set)):
+            items = list(value)[:10]
+            normalized = [self._normalize_value(item) for item in items]
+            if len(value) > 10:
+                normalized.append(f"... 共 {len(value)} 项")
+            return normalized
+        if isinstance(value, str):
+            cleaned = self._mask_inline_secret(value.replace("\n", " ").replace("\r", " ").strip())
+            if len(cleaned) > 220:
+                return cleaned[:217] + "..."
+            return cleaned
+        if value is None or type(value) in {bool, int, float}:
+            return value
+        return self._safe_diagnostic_text(value, single_line=True)
+
+    def new_trace_id(self, prefix: str = "trace") -> str:
+        """生成带稳定平台前缀的规范化 trace_id。"""
+        normalized = normalize_trace_prefix(prefix)
+        stamp = datetime.now().strftime("%H%M%S")
+        short = uuid.uuid4().hex[:8]
+        return f"{normalized}_{stamp}_{short}"
+
+    def pick_used(self, source: dict[str, Any] | None, *keys: str) -> dict[str, Any]:
+        
+        if not source:
+            return {}
+        return self._clean_mapping({key: source.get(key) for key in keys if key in source})
+
+    def _write_error_summary(
+        self,
+        component: str,
+        action: str,
+        message: str,
+        status_code: int | str | None,
+        trace_id: str | None,
+        context: dict[str, Any] | None,
+        details: dict[str, Any] | None,
+    ):
+        # 错误摘要始终覆盖为“最近一次错误”，这样用户从 UI 打开时能直接看到最新诊断结论。
+        message = self._mask_inline_secret(str(message))
+        severity = self._infer_error_severity(component, action, status_code, details)
+        conclusion = self._build_error_conclusion(component, action, status_code, details)
+        suggestions = self._build_error_suggestions(component, action, status_code, details)
+        lines = [
+            "# 最近错误摘要",
+            "",
+            f"- 时间: {self._now()}",
+            f"- 模块: {component}",
+            f"- 动作: {action}",
+            f"- 状态码: {status_code or '未提供'}",
+            f"- 错误分级: {severity}",
+            f"- 追踪ID: {trace_id or '未提供'}",
+            f"- 错误说明: {message or '未提供'}",
+            "",
+        ]
+        lines.append("## 自动建议结论")
+        lines.append(f"- {conclusion}")
+        lines.append("")
+        if self._clean_mapping(context):
+            lines.append("## 上下文")
+            for key, value in self._clean_mapping(context).items():
+                lines.append(f"- {key}: {self._normalize_value(value)}")
+            lines.append("")
+        if self._clean_mapping(details):
+            lines.append("## 关键详情")
+            for key, value in self._clean_mapping(details).items():
+                lines.append(f"- {key}: {self._normalize_value(value)}")
+            lines.append("")
+        lines.append("## 优先排查")
+        for item in suggestions:
+            lines.append(f"- {item}")
+        lines.append("")
+        with self._lock:
+            # 摘要与普通日志共享 Windows 文件锁降级策略。
+            self._safe_write_text(self.latest_error_summary_file, "\n".join(lines))
+
+    def _infer_error_severity(
+        self,
+        component: str,
+        action: str,
+        status_code: int | str | None,
+        details: dict[str, Any] | None,
+    ) -> str:
+        # 这里做的是“面向排障”的粗粒度优先级分类，不追求精确异常学术定义。
+        text = f"{component} {action} {status_code or ''} {json.dumps(self._normalize_value(details or {}), ensure_ascii=False)}".lower()
+        if "stop" in text or "用户停止" in text:
+            return "P4-用户操作"
+        if "permission" in text or "权限" in text or "file not found" in text or "未找到" in text:
+            return "P1-阻断"
+        if "ffmpeg" in text or "n_m3u8dl" in text or "merge" in text:
+            return "P2-高"
+        if "api" in action.lower() or "bili" in text or "douyin" in text or "kuaishou" in text or "missav" in text:
+            return "P2-高"
+        if "download" in text:
+            return "P2-高"
+        return "P3-中"
+
+    def _build_error_conclusion(
+        self,
+        component: str,
+        action: str,
+        status_code: int | str | None,
+        details: dict[str, Any] | None,
+    ) -> str:
+        text = f"{component} {action} {status_code or ''} {json.dumps(self._normalize_value(details or {}), ensure_ascii=False)}".lower()
+        if "ffmpeg" in text:
+            return "问题大概率出在 ffmpeg 执行或合并阶段，优先核对输入 URL、Referer、输出路径和 ffmpeg 是否可用。"
+        if "n_m3u8dl" in text or "m3u8" in text:
+            return "问题大概率出在 HLS 流下载阶段，优先核对 m3u8 地址、Referer、User-Agent 和保存目录权限。"
+        if "bili" in text:
+            return "问题大概率出在 Bilibili 接口取流或音视频流下载阶段，建议先检查 get_play_url 和 stream_* 记录。"
+        if "douyin" in text:
+            return "问题大概率出在抖音详情解析或资源下载阶段，建议先检查 detail / search / account 和 DouyinDownloader 记录。"
+        if "kuaishou" in text:
+            return "问题大概率出在快手视频流捕获或下载阶段，建议先检查资源捕获日志和最终提交的下载 URL。"
+        if "missav" in text:
+            return "问题大概率出在 MissAV 页面嗅探或 m3u8 提交阶段，建议先检查 playlist.m3u8 嗅探结果和下载参数。"
+        if "downloadworker" in text or "downloadmanager" in text:
+            return "问题大概率出在任务入队、分发或下载线程执行阶段，建议按 DL_QUEUE 到 DL_START 的链路逆向排查。"
+        return "问题位置需要结合追踪ID继续查看相邻的 API、COMMAND 和下载记录来判断。"
+
+    def _build_error_suggestions(
+        self,
+        component: str,
+        action: str,
+        status_code: int | str | None,
+        details: dict[str, Any] | None,
+    ) -> list[str]:
+        detail_text = json.dumps(self._normalize_value(details or {}), ensure_ascii=False)
+        suggestions = [
+            "先用追踪ID在 latest_debug.log 中全文搜索，查看同一任务前后的 API、入队、下载和合并记录。",
+        ]
+        if "Bili" in component or "BILI" in str(status_code):
+            suggestions.append("重点检查 `API::get_play_url`、`stream_video`、`stream_audio` 和 `ffmpeg` 记录是否连续。")
+            suggestions.append("如果是播放流失败，优先确认 `audio_url/video_url` 是否为空、Cookie 是否失效、画质是否受限。")
+        if "Douyin" in component or "DOUYIN" in str(status_code):
+            suggestions.append("重点检查 `API::detail`、`API::account_page`、`API::search_page` 和 `DouyinDownloader` 的记录。")
+            suggestions.append("如果是下载失败，优先确认资源链接是否过期，以及 Cookie/Referer 是否仍有效。")
+        if "ffmpeg" in component.lower() or "ffmpeg" in detail_text.lower():
+            suggestions.append("查看 ffmpeg 参数块，确认输入 URL、Referer、输出路径是否正确。")
+        if "N_m3u8DL" in component or "m3u8" in detail_text.lower():
+            suggestions.append("查看 N_m3u8DL-RE 参数块，确认 m3u8 链接、保存目录、User-Agent 和 Referer 是否正确。")
+        if "DownloadWorker" in component or "DownloadManager" in component:
+            suggestions.append("从 `DL_QUEUE -> DL_DISPATCH -> DL_START -> 下载器记录` 这一条链路逆向定位。")
+        if len(suggestions) < 3:
+            suggestions.append("结合模块名和状态码，继续查看同时间附近的上一条 API 或 COMMAND 记录。")
+        return suggestions
+
+    @_best_effort_diagnostic
+    def log(
+        self,
+        component: str,
+        action: str,
+        level: str = "INFO",
+        message: str = "",
+        status_code: int | str | None = None,
+        context: dict[str, Any] | None = None,
+        details: dict[str, Any] | None = None,
+        trace_id: str | None = None,
+    ):
+        level_text = self._safe_diagnostic_text(
+            level or "INFO",
+            fallback="INFO",
+            single_line=True,
+        ).upper()
+        if not self._should_write_level(level_text):
+            return
+        component = self._safe_diagnostic_text(component, single_line=True)
+        action = self._safe_diagnostic_text(action, single_line=True)
+        message = self._safe_diagnostic_text(message)
+        status_code = (
+            None
+            if status_code is None
+            else self._safe_diagnostic_text(status_code, single_line=True)
+        )
+        trace_id = (
+            ""
+            if trace_id is None
+            else self._safe_diagnostic_text(trace_id, single_line=True)
+        )
+        context = self._clean_mapping(context)
+        details = self._clean_mapping(details)
+        lines = [
+            "-" * 88,
+            f"[{self._now()}] [{level_text}] {component} / {action}",
+        ]
+        if message:
+            lines.append(f"说明: {message}")
+        if status_code is not None:
+            lines.append(f"状态码: {status_code}")
+        if trace_id:
+            lines.append(f"追踪ID: {trace_id}")
+        lines.extend(self._format_mapping("上下文", context))
+        lines.extend(self._format_mapping("详情", details))
+        lines.append("")
+        self._append_lines(lines)
+        if level_text == "ERROR":
+            self._write_error_summary(component, action, message, status_code, trace_id, context, details)
+
+    @_best_effort_diagnostic
+    def log_api(
+        self,
+        component: str,
+        api_name: str,
+        request: dict[str, Any] | None = None,
+        response_summary: dict[str, Any] | None = None,
+        level: str = "INFO",
+        message: str = "",
+        status_code: int | str | None = None,
+        trace_id: str | None = None,
+    ):
+        level_text = self._safe_diagnostic_text(
+            level or "INFO",
+            fallback="INFO",
+            single_line=True,
+        ).upper()
+        if not self._should_write_level(level_text):
+            return
+        component = self._safe_diagnostic_text(component, single_line=True)
+        api_name = self._safe_diagnostic_text(api_name, single_line=True)
+        message = self._safe_diagnostic_text(message)
+        status_code = (
+            None
+            if status_code is None
+            else self._safe_diagnostic_text(status_code, single_line=True)
+        )
+        trace_id = (
+            ""
+            if trace_id is None
+            else self._safe_diagnostic_text(trace_id, single_line=True)
+        )
+        request = self._clean_mapping(request)
+        response_summary = self._clean_mapping(response_summary)
+        lines = [
+            "-" * 88,
+            f"[{self._now()}] [{level_text}] {component} / API::{api_name}",
+        ]
+        if message:
+            lines.append(f"说明: {message}")
+        if status_code is not None:
+            lines.append(f"状态码: {status_code}")
+        if trace_id:
+            lines.append(f"追踪ID: {trace_id}")
+        lines.extend(self._format_mapping("请求", request))
+        lines.extend(self._format_mapping("响应摘要", response_summary))
+        lines.append("")
+        self._append_lines(lines)
+        if level_text == "ERROR":
+            self._write_error_summary(component, f"API::{api_name}", message, status_code, trace_id, request, response_summary)
+
+    @_best_effort_diagnostic
+    def log_command(
+        self,
+        component: str,
+        tool_name: str,
+        command_args: list[str] | tuple[str, ...] | None = None,
+        message: str = "",
+        context: dict[str, Any] | None = None,
+        trace_id: str | None = None,
+    ):
+        
+        details = {}
+        if command_args:
+            details["args"] = self._redact_command_args(command_args)
+        component = self._safe_diagnostic_text(component, single_line=True)
+        tool_name = self._safe_diagnostic_text(tool_name, single_line=True)
+        message = self._safe_diagnostic_text(message)
+        trace_id = (
+            ""
+            if trace_id is None
+            else self._safe_diagnostic_text(trace_id, single_line=True)
+        )
+        context = self._clean_mapping(context)
+        lines = [
+            "-" * 88,
+            f"[{self._now()}] [COMMAND] {component} / {tool_name}",
+        ]
+        if message:
+            lines.append(f"说明: {message}")
+        if trace_id:
+            lines.append(f"追踪ID: {trace_id}")
+        lines.extend(self._format_mapping("上下文", context))
+        lines.extend(self._format_mapping("参数", details))
+        lines.append("")
+        self._append_lines(lines)
+
+    @_best_effort_diagnostic
+    def log_exception(
+        self,
+        component: str,
+        action: str,
+        exc: Exception,
+        context: dict[str, Any] | None = None,
+        trace_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ):
+        
+        self.log(
+            component=component,
+            action=action,
+            level="ERROR",
+            message=exc,
+            context=context,
+            details={"exception_type": type(exc).__name__, **(details or {})},
+            trace_id=trace_id,
+        )
+
+_debug_logger_singleton: DebugLogger | None = None
+
+def get_debug_logger() -> DebugLogger:
+    
+    global _debug_logger_singleton
+    if _debug_logger_singleton is None:
+        _debug_logger_singleton = DebugLogger()
+    return _debug_logger_singleton
+
+class DebugLoggerProxy:
+    """惰性代理，避免模块导入时立刻创建日志目录和文件。"""
+
+    def __getattr__(self, name: str):
+        return getattr(get_debug_logger(), name)
+
+    def __setattr__(self, name: str, value):
+        setattr(get_debug_logger(), name, value)
+
+    def __delattr__(self, name: str):
+        """允许测试补丁干净地移除惰性 logger 上的属性。"""
+        logger = get_debug_logger()
+        if name in getattr(logger, "__dict__", {}):
+            delattr(logger, name)
+            return
+        raise AttributeError(name)
+
+debug_logger = DebugLoggerProxy()

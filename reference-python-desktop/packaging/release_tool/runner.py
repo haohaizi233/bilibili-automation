@@ -1,0 +1,781 @@
+"""Deterministic orchestration for release-builder requests."""
+
+from __future__ import annotations
+
+import json
+import re
+import threading
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, fields, replace
+from pathlib import Path
+from typing import Protocol, TypeVar
+from urllib.parse import urlparse
+
+from .events import redact_release_text
+from .models import BuildRequest, ReleaseMode, ReleaseResult, ReleaseStage, RemoteReleaseInfo
+from .modes import resolve_release_mode, validate_build_request
+from .proxy import validate_proxy_label_reference
+from .versioning import VersionUpdatePlan, VersionUpdateResult, normalize_version
+
+
+class ReleaseEventSink(Protocol):
+    def emit(
+        self,
+        kind: str,
+        *,
+        stage: ReleaseStage,
+        progress: int,
+        message: str = "",
+        data: Mapping[str, object] | None = None,
+    ) -> object: ...
+
+
+def _noop_signing_transaction() -> None:
+    return None
+
+
+@dataclass(frozen=True)
+class SigningMaterial:
+    """Resolved release signing inputs without exposing their contents."""
+
+    private_key_path: Path | None
+    public_key_path: Path | None
+    fingerprint: str
+    trust_anchor_changed: bool
+    commit_transaction: Callable[[], None] = field(
+        default=_noop_signing_transaction,
+        repr=False,
+        compare=False,
+    )
+    rollback_transaction: Callable[[], None] = field(
+        default=_noop_signing_transaction,
+        repr=False,
+        compare=False,
+    )
+
+
+@dataclass(frozen=True)
+class ReleasePipelineHooks:
+    plan_version: Callable[[str], VersionUpdatePlan]
+    apply_version: Callable[[str], VersionUpdateResult]
+    resolve_signing_material: Callable[[BuildRequest], SigningMaterial]
+    build_portable: Callable[[], None]
+    build_installer: Callable[[], None]
+    run_smoke_tests: Callable[[], None]
+    sign_manifest: Callable[[BuildRequest], tuple[Path, ...]]
+    commit_version_changes: Callable[[BuildRequest], str]
+    push_main: Callable[[BuildRequest, str], None]
+    ensure_tag: Callable[[BuildRequest, str], None]
+    ensure_release: Callable[[BuildRequest], None]
+    upload_assets: Callable[[BuildRequest, tuple[Path, ...]], None]
+    verify_remote_assets: Callable[[BuildRequest, tuple[Path, ...]], None]
+    publish_release: Callable[[BuildRequest], None]
+    validate_dependencies: Callable[[BuildRequest], None] = lambda _request: None
+    prepare: Callable[[BuildRequest, ReleaseMode], None] = lambda _request, _mode: None
+    cleanup: Callable[[], None] = lambda: None
+    activate_stage: Callable[[ReleaseStage, int], None] = lambda _stage, _progress: None
+
+
+class PipelineCancelled(RuntimeError):
+    """Internal cancellation marker that is never emitted as an error."""
+
+
+class CancellationToken:
+    def __init__(
+        self,
+        *,
+        is_cancel_requested: Callable[[], bool] | None = None,
+        begin_irreversible: Callable[[], bool] | None = None,
+    ) -> None:
+        self._cancelled = threading.Event()
+        self._lock = threading.Lock()
+        self._completed = False
+        self._irreversible = False
+        self._external_cancel_requested = is_cancel_requested
+        self._external_begin_irreversible = begin_irreversible
+
+    def cancel(self) -> None:
+        with self._lock:
+            if not self._completed and not self._irreversible:
+                self._cancelled.set()
+
+    def raise_if_cancelled(self) -> None:
+        with self._lock:
+            if not self._irreversible and self._is_cancel_requested_unlocked():
+                raise PipelineCancelled("release request cancelled")
+
+    def mark_completed(self) -> None:
+        with self._lock:
+            if not self._irreversible and self._is_cancel_requested_unlocked():
+                raise PipelineCancelled("release request cancelled")
+            self._completed = True
+
+    def begin_irreversible(self) -> None:
+        """Close cancellation before non-rollbackable publication work begins."""
+
+        with self._lock:
+            if self._irreversible:
+                return
+            if self._is_cancel_requested_unlocked():
+                raise PipelineCancelled("release request cancelled")
+            if (
+                self._external_begin_irreversible is not None
+                and not self._external_begin_irreversible()
+            ):
+                raise PipelineCancelled("release request cancelled")
+            self._irreversible = True
+
+    def _is_cancel_requested_unlocked(self) -> bool:
+        return self._cancelled.is_set() or (
+            self._external_cancel_requested is not None
+            and bool(self._external_cancel_requested())
+        )
+
+
+_T = TypeVar("_T")
+_PROGRESS = {
+    ReleaseStage.PREFLIGHT: 0,
+    ReleaseStage.VERSION_SYNC: 10,
+    ReleaseStage.SOURCE_IDENTITY: 20,
+    ReleaseStage.BUILDING_PORTABLE: 30,
+    ReleaseStage.BUILDING_INSTALLER: 50,
+    ReleaseStage.SIGNING: 65,
+    ReleaseStage.SMOKE_TESTING: 70,
+    ReleaseStage.GIT: 75,
+    ReleaseStage.PREPARING_RELEASE: 75,
+    ReleaseStage.UPLOADING: 85,
+    ReleaseStage.VERIFYING: 95,
+    ReleaseStage.PUBLISHING: 98,
+    ReleaseStage.SUCCEEDED: 100,
+    ReleaseStage.FAILED: 100,
+    ReleaseStage.CANCELLED: 100,
+}
+_SIDE_EFFECT_FIELDS = (
+    "apply_version",
+    "build_portable",
+    "build_installer",
+    "run_smoke_tests",
+    "generate_manifest_key",
+    "rotate_trust_anchor",
+    "sign_manifest",
+    "commit_version_changes",
+    "push_main",
+    "create_or_reuse_tag",
+    "create_or_update_release",
+    "upload_release_assets",
+    "upload_public_key",
+    "verify_remote_assets",
+)
+_BOOLEAN_FIELDS = frozenset(_SIDE_EFFECT_FIELDS + ("dry_run", "same_release_repair", "offline_debug"))
+_STRING_FIELDS = frozenset(
+    {
+        "target_version",
+        "repository",
+        "release_notes_path",
+        "output_root",
+        "private_key_path",
+        "proxy_label",
+        "custom_proxy",
+    }
+)
+_INTEGER_FIELDS = frozenset({"release_revision"})
+_REFERENCE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def run_release_request(
+    request: BuildRequest,
+    hooks: ReleasePipelineHooks,
+    emitter: ReleaseEventSink,
+    cancel_token: CancellationToken,
+    *,
+    initial_diagnostics: Sequence[str] = (),
+) -> ReleaseResult:
+    """Run requested stages once, emitting monotonic, redacted lifecycle events."""
+
+    mode = _fallback_mode(request)
+    current_stage = ReleaseStage.PREFLIGHT
+    artifacts: tuple[Path, ...] = ()
+    cleaned_up = False
+    signing_material: SigningMaterial | None = None
+    signing_transaction_finalized = False
+    secondary_diagnostics: list[str] = []
+    for diagnostic in initial_diagnostics:
+        try:
+            safe_diagnostic = redact_release_text(str(diagnostic)).strip()
+        except BaseException:
+            continue
+        if safe_diagnostic and safe_diagnostic not in secondary_diagnostics:
+            secondary_diagnostics.append(safe_diagnostic)
+
+    def emit(
+        kind: str,
+        stage: ReleaseStage,
+        *,
+        message: str = "",
+        data: Mapping[str, object] | None = None,
+        progress: int | None = None,
+    ) -> None:
+        effective_progress = _PROGRESS[stage] if progress is None else progress
+        hooks.activate_stage(stage, effective_progress)
+        emitter.emit(
+            kind,
+            stage=stage,
+            progress=effective_progress,
+            message=message,
+            data=data,
+        )
+
+    def run_stage(stage: ReleaseStage, action: Callable[[], _T]) -> _T:
+        nonlocal current_stage
+        cancel_token.raise_if_cancelled()
+        current_stage = stage
+        emit("stage", stage)
+        value = action()
+        cancel_token.raise_if_cancelled()
+        return value
+
+    def skip_stage(stage: ReleaseStage) -> None:
+        nonlocal current_stage
+        cancel_token.raise_if_cancelled()
+        current_stage = stage
+        emit("stage", stage, data={"status": "skipped"})
+        cancel_token.raise_if_cancelled()
+
+    def cleanup_once() -> None:
+        nonlocal cleaned_up
+        if cleaned_up:
+            return
+        cleaned_up = True
+        hooks.cleanup()
+
+    def cleanup_after(primary: BaseException) -> None:
+        try:
+            cleanup_once()
+        except BaseException as cleanup_error:
+            secondary_diagnostics.append(
+                _attach_secondary_diagnostic(
+                    primary,
+                    "cleanup failed",
+                    cleanup_error,
+                )
+            )
+
+    def commit_signing_transaction() -> None:
+        nonlocal signing_transaction_finalized
+        if signing_material is None or signing_transaction_finalized:
+            return
+        signing_material.commit_transaction()
+        signing_transaction_finalized = True
+
+    def rollback_signing_transaction() -> None:
+        nonlocal signing_transaction_finalized
+        if signing_material is None or signing_transaction_finalized:
+            return
+        signing_material.rollback_transaction()
+        signing_transaction_finalized = True
+
+    def begin_irreversible_once() -> None:
+        cancel_token.raise_if_cancelled()
+        cancel_token.begin_irreversible()
+
+    def publish_irreversibly() -> None:
+        cleanup_once()
+        begin_irreversible_once()
+        commit_signing_transaction()
+        hooks.publish_release(request)
+
+    interrupted: BaseException | None = None
+    try:
+        def preflight() -> ReleaseMode:
+            resolved_mode = _preflight(request)
+            hooks.validate_dependencies(request)
+            if not request.dry_run:
+                hooks.prepare(request, resolved_mode)
+            return resolved_mode
+
+        mode = run_stage(ReleaseStage.PREFLIGHT, preflight)
+        if request.dry_run:
+            run_stage(ReleaseStage.VERSION_SYNC, lambda: hooks.plan_version(request.target_version))
+            for stage in (
+                ReleaseStage.SOURCE_IDENTITY,
+                ReleaseStage.BUILDING_PORTABLE,
+                ReleaseStage.BUILDING_INSTALLER,
+                ReleaseStage.SIGNING,
+                ReleaseStage.SMOKE_TESTING,
+                ReleaseStage.PREPARING_RELEASE,
+                ReleaseStage.UPLOADING,
+                ReleaseStage.VERIFYING,
+                ReleaseStage.PUBLISHING,
+            ):
+                skip_stage(stage)
+        else:
+            signing_material = resolve_signing_material(
+                request,
+                hooks.resolve_signing_material,
+                diagnostics=secondary_diagnostics,
+            )
+            if request.apply_version:
+                run_stage(ReleaseStage.VERSION_SYNC, lambda: hooks.apply_version(request.target_version))
+            if _needs_source_identity_stage(request):
+                commit = ""
+
+                def establish_source_identity() -> None:
+                    nonlocal commit
+                    if request.commit_version_changes:
+                        begin_irreversible_once()
+                        commit = hooks.commit_version_changes(request)
+                    if (
+                        mode is ReleaseMode.NEW_RELEASE
+                        and request.create_or_reuse_tag
+                        and not str(commit or "").strip()
+                    ):
+                        raise ValueError(
+                            "new release tag requires a verified version commit"
+                        )
+                    cancel_token.raise_if_cancelled()
+                    if (
+                        (
+                            signing_material is not None
+                            and signing_material.trust_anchor_changed
+                        )
+                        or request.push_main
+                        or request.create_or_reuse_tag
+                    ):
+                        begin_irreversible_once()
+                    if (
+                        signing_material is not None
+                        and signing_material.trust_anchor_changed
+                    ):
+                        commit_signing_transaction()
+                    if request.push_main:
+                        hooks.push_main(request, commit)
+                    if request.create_or_reuse_tag:
+                        hooks.ensure_tag(request, commit)
+
+                run_stage(ReleaseStage.SOURCE_IDENTITY, establish_source_identity)
+            if request.build_portable:
+                run_stage(ReleaseStage.BUILDING_PORTABLE, hooks.build_portable)
+            if request.build_installer:
+                run_stage(ReleaseStage.BUILDING_INSTALLER, hooks.build_installer)
+            if request.sign_manifest:
+                artifacts = run_stage(
+                    ReleaseStage.SIGNING,
+                    lambda: hooks.sign_manifest(request),
+                )
+            if request.run_smoke_tests:
+                run_stage(ReleaseStage.SMOKE_TESTING, hooks.run_smoke_tests)
+            if request.create_or_update_release:
+                run_stage(
+                    ReleaseStage.PREPARING_RELEASE,
+                    lambda: hooks.ensure_release(request),
+                )
+            if request.upload_release_assets or request.upload_public_key:
+                run_stage(ReleaseStage.UPLOADING, lambda: hooks.upload_assets(request, artifacts))
+            if request.verify_remote_assets:
+                run_stage(
+                    ReleaseStage.VERIFYING,
+                    lambda: hooks.verify_remote_assets(request, artifacts),
+                )
+            if request.create_or_update_release:
+                run_stage(
+                    ReleaseStage.PUBLISHING,
+                    publish_irreversibly,
+                )
+        if not request.create_or_update_release:
+            cancel_token.raise_if_cancelled()
+            cleanup_once()
+            cancel_token.raise_if_cancelled()
+            if signing_material is not None and not signing_transaction_finalized:
+                begin_irreversible_once()
+                commit_signing_transaction()
+        cancel_token.mark_completed()
+    except PipelineCancelled as cancellation:
+        try:
+            rollback_signing_transaction()
+        except BaseException as rollback_error:
+            secondary_diagnostics.append(
+                _attach_secondary_diagnostic(
+                    cancellation,
+                    "rollback failed",
+                    rollback_error,
+                )
+            )
+        cleanup_after(cancellation)
+        diagnostics = _combined_diagnostics(
+            cancellation,
+            secondary_diagnostics,
+        )
+        terminal_progress = _PROGRESS[current_stage]
+        emit("stage", ReleaseStage.CANCELLED, progress=terminal_progress)
+        result_data: dict[str, object] = {"status": "cancelled"}
+        if diagnostics:
+            result_data["diagnostics"] = list(diagnostics)
+        emit(
+            "result",
+            ReleaseStage.CANCELLED,
+            data=result_data,
+            progress=terminal_progress,
+        )
+        return ReleaseResult(
+            mode=mode,
+            stage=ReleaseStage.CANCELLED,
+            errors=diagnostics,
+            failed_stage=current_stage,
+        )
+    except (Exception, SystemExit) as error:
+        failure = error
+        try:
+            rollback_signing_transaction()
+        except BaseException as rollback_error:
+            secondary_diagnostics.append(
+                _attach_secondary_diagnostic(
+                    failure,
+                    "rollback failed",
+                    rollback_error,
+                )
+            )
+        cleanup_after(failure)
+        message = _failure_message(failure)
+        diagnostics = _combined_diagnostics(
+            failure,
+            secondary_diagnostics,
+        )
+        emit("error", current_stage, message=message)
+        terminal_progress = _PROGRESS[current_stage]
+        emit("stage", ReleaseStage.FAILED, progress=terminal_progress)
+        result_data: dict[str, object] = {"status": "failed", "error": message}
+        if diagnostics:
+            result_data["diagnostics"] = list(diagnostics)
+        emit(
+            "result",
+            ReleaseStage.FAILED,
+            data=result_data,
+            progress=terminal_progress,
+        )
+        return ReleaseResult(
+            mode=mode,
+            stage=ReleaseStage.FAILED,
+            errors=(message, *diagnostics),
+            artifacts=tuple(str(path) for path in artifacts),
+            failed_stage=current_stage,
+            error=message,
+        )
+    except BaseException as error:
+        interrupted = error
+        raise
+    finally:
+        if interrupted is not None:
+            try:
+                rollback_signing_transaction()
+            except BaseException as rollback_error:
+                _attach_secondary_diagnostic(
+                    interrupted,
+                    "rollback failed",
+                    rollback_error,
+                )
+            try:
+                cleanup_once()
+            except BaseException as cleanup_error:
+                _attach_secondary_diagnostic(
+                    interrupted,
+                    "cleanup failed",
+                    cleanup_error,
+                )
+
+    emit("stage", ReleaseStage.SUCCEEDED)
+    emit("result", ReleaseStage.SUCCEEDED, data={"status": "succeeded"})
+    return ReleaseResult(
+        mode=mode,
+        stage=ReleaseStage.SUCCEEDED,
+        artifacts=tuple(str(path) for path in artifacts),
+    )
+
+
+def resolve_signing_material(
+    request: BuildRequest,
+    resolver: Callable[[BuildRequest], SigningMaterial],
+    *,
+    diagnostics: list[str] | None = None,
+) -> SigningMaterial | None:
+    """Resolve signing inputs before source identity or build side effects."""
+
+    if not (
+        request.generate_manifest_key
+        or request.sign_manifest
+        or request.upload_release_assets
+        or request.upload_public_key
+    ):
+        return None
+    material = resolver(request)
+    if not isinstance(material, SigningMaterial):
+        raise TypeError("release signing material resolver returned an invalid result")
+    try:
+        if request.rotate_trust_anchor and not material.trust_anchor_changed:
+            raise ValueError(
+                "trust anchor rotation did not update the production trust anchor"
+            )
+        if not request.rotate_trust_anchor and material.trust_anchor_changed:
+            raise ValueError(
+                "production trust anchor changed without explicit rotation"
+            )
+    except (Exception, SystemExit) as error:
+        try:
+            material.rollback_transaction()
+        except BaseException as rollback_error:
+            diagnostic = _attach_secondary_diagnostic(
+                error,
+                "rollback failed",
+                rollback_error,
+            )
+            if diagnostics is not None:
+                diagnostics.append(diagnostic)
+        raise
+    return material
+
+
+def load_request_file(path: Path) -> BuildRequest:
+    """Load one strict JSON request without accepting secret material."""
+
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("release request file is not valid JSON") from error
+    if not isinstance(payload, dict):
+        raise ValueError("release request must be a JSON object")
+
+    allowed = {field.name for field in fields(BuildRequest)}
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise ValueError("release request contains unknown fields")
+    values: dict[str, object] = {}
+    for key, value in payload.items():
+        if key in _BOOLEAN_FIELDS:
+            if not isinstance(value, bool):
+                raise ValueError(f"release request field {key} must be a boolean")
+        elif key in _STRING_FIELDS:
+            if not isinstance(value, str):
+                raise ValueError(f"release request field {key} must be a string")
+        elif key in _INTEGER_FIELDS:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"release request field {key} must be an integer")
+        elif key == "remote":
+            value = _load_remote(value)
+        else:  # Defensive guard for future BuildRequest fields.
+            raise ValueError(f"release request field {key} is not supported")
+        values[key] = value
+
+    if "target_version" not in values:
+        raise ValueError("release request requires target_version")
+    if values.get("same_release_repair") is True and "release_revision" not in values:
+        raise ValueError(
+            "same version publication requires an explicit release_revision"
+        )
+    values["target_version"] = normalize_version(str(values["target_version"]))
+    _validate_secret_reference(str(values.get("private_key_path", "")))
+    values["proxy_label"] = validate_proxy_label_reference(
+        str(values.get("proxy_label", BuildRequest.__dataclass_fields__["proxy_label"].default))
+    )
+    _validate_proxy_reference(str(values.get("custom_proxy", "")))
+    return BuildRequest(**values)
+
+
+def _load_remote(value: object) -> RemoteReleaseInfo:
+    if not isinstance(value, dict):
+        raise ValueError("release request field remote must be an object")
+    unknown = sorted(
+        set(value)
+        - {
+            "version",
+            "release_revision",
+            "release_tags",
+            "occupied_tags",
+            "resumable_tags",
+            "error",
+        }
+    )
+    if unknown:
+        raise ValueError("release request remote contains unknown fields")
+    version = value.get("version", "")
+    error = value.get("error", "")
+    release_revision = value.get("release_revision", 0)
+    release_tags = value.get("release_tags", ())
+    occupied_tags = value.get("occupied_tags", ())
+    resumable_tags = value.get("resumable_tags", ())
+    if not isinstance(version, str) or not isinstance(error, str):
+        raise ValueError("release request remote version and error must be strings")
+    if isinstance(release_revision, bool) or not isinstance(release_revision, int):
+        raise ValueError("release request remote revision must be an integer")
+    for label, tags in (
+        ("release", release_tags),
+        ("occupied", occupied_tags),
+        ("resumable", resumable_tags),
+    ):
+        if not isinstance(tags, (list, tuple)) or not all(
+            isinstance(tag, str) for tag in tags
+        ):
+            raise ValueError(
+                f"release request remote {label} tags must be a string array"
+            )
+    if version and error:
+        raise ValueError("release request remote cannot include both version and error")
+    if version:
+        return RemoteReleaseInfo.available(
+            version,
+            release_revision,
+            release_tags=tuple(release_tags),
+            occupied_tags=tuple(occupied_tags),
+            resumable_tags=tuple(resumable_tags),
+        )
+    if error:
+        return RemoteReleaseInfo.unavailable(error)
+    return RemoteReleaseInfo.unknown()
+
+
+def _validate_secret_reference(value: str) -> None:
+    text = str(value or "").strip()
+    if not text:
+        return
+    if "-----BEGIN" in text or "\n" in text or "\r" in text:
+        raise ValueError("private_key_path must be a path or reference, never key material")
+    if text.startswith("env:") and not _REFERENCE_RE.fullmatch(text[4:]):
+        raise ValueError("private_key_path reference is invalid")
+
+
+def _validate_proxy_reference(value: str) -> None:
+    text = str(value or "").strip()
+    if not text:
+        return
+    if text.startswith("env:"):
+        if not _REFERENCE_RE.fullmatch(text[4:]):
+            raise ValueError("custom_proxy reference is invalid")
+        return
+    parsed = urlparse(text if "://" in text else f"//{text}")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("custom_proxy credentials must use an environment reference")
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if (
+        parsed.scheme.casefold() not in {"", "http", "https", "socks4", "socks5"}
+        or not parsed.hostname
+        or not port
+        or parsed.path
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("custom proxy endpoint is invalid")
+
+
+def _preflight(request: BuildRequest) -> ReleaseMode:
+    validation_request = replace(request, dry_run=False) if request.dry_run else request
+    errors = validate_build_request(validation_request)
+    if errors:
+        raise ValueError("; ".join(errors))
+    return resolve_release_mode(
+        request.target_version,
+        request.remote,
+        same_release_repair=request.same_release_repair,
+        offline_debug=request.offline_debug,
+    )
+
+
+def _fallback_mode(request: BuildRequest) -> ReleaseMode:
+    try:
+        return resolve_release_mode(
+            request.target_version,
+            request.remote,
+            same_release_repair=request.same_release_repair,
+            offline_debug=request.offline_debug,
+        )
+    except ValueError:
+        return ReleaseMode.OFFLINE_DEBUG if request.offline_debug else ReleaseMode.LOCAL_DEBUG
+
+
+def _needs_source_identity_stage(request: BuildRequest) -> bool:
+    return any(
+        getattr(request, field)
+        for field in (
+            "commit_version_changes",
+            "push_main",
+            "create_or_reuse_tag",
+        )
+    )
+
+
+def _attach_secondary_diagnostic(
+    primary: BaseException,
+    label: str,
+    secondary: BaseException,
+) -> str:
+    diagnostic = f"{label}: {_failure_message(secondary)}"
+    try:
+        add_note = getattr(primary, "add_note", None)
+    except BaseException:
+        return diagnostic
+    if callable(add_note):
+        try:
+            add_note(diagnostic)
+        except BaseException:
+            pass
+    return diagnostic
+
+
+def _failure_diagnostics(error: BaseException) -> tuple[str, ...]:
+    try:
+        notes = getattr(error, "__notes__", ())
+    except BaseException:
+        return ()
+    if not isinstance(notes, (list, tuple)):
+        return ()
+    diagnostics: list[str] = []
+    for note in notes:
+        try:
+            safe_note = redact_release_text(str(note)).strip()
+        except BaseException:
+            continue
+        if safe_note and safe_note not in diagnostics:
+            diagnostics.append(safe_note)
+    return tuple(diagnostics)
+
+
+def _combined_diagnostics(
+    error: BaseException,
+    explicit: list[str],
+) -> tuple[str, ...]:
+    diagnostics: list[str] = []
+    for diagnostic in (*_failure_diagnostics(error), *explicit):
+        if diagnostic and diagnostic not in diagnostics:
+            diagnostics.append(diagnostic)
+    return tuple(diagnostics)
+
+
+def _failure_message(error: BaseException) -> str:
+    try:
+        if isinstance(error, SystemExit):
+            value = error.code
+            if value is None:
+                text = "release pipeline exited"
+            elif isinstance(value, int):
+                text = f"release pipeline exited with status {value}"
+            else:
+                text = str(value)
+        else:
+            text = str(error)
+    except BaseException:
+        text = "release pipeline failed"
+    try:
+        return redact_release_text(text) or "release pipeline failed"
+    except BaseException:
+        return "release pipeline failed"
+
+
+__all__ = [
+    "CancellationToken",
+    "ReleasePipelineHooks",
+    "SigningMaterial",
+    "load_request_file",
+    "resolve_signing_material",
+    "run_release_request",
+]

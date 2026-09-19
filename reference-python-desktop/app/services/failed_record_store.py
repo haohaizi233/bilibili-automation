@@ -1,0 +1,1104 @@
+"""失败下载记录的异步 SQLite 存储，供失败列表分页和筛选使用。"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import time
+from collections.abc import Iterable
+from contextlib import closing, contextmanager
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from itertools import islice
+from pathlib import Path
+from typing import Any, Callable, Iterator, Mapping
+
+from app.debug_logger import debug_logger
+from app.utils.runtime_paths import user_data_root
+
+
+@dataclass(frozen=True)
+class FailedRecordQuery:
+    limit: int = 100
+    offset: int = 0
+    platform: str = ""
+    status: str = ""
+    trace_query: str = ""
+    keyword: str = ""
+    failed_from: str = ""
+    failed_to: str = ""
+    order: str = "desc"
+
+
+@dataclass(frozen=True)
+class FailedRecordQueryResult:
+    records: list[dict[str, Any]]
+    total_count: int
+    limit: int
+    offset: int
+
+
+_MAX_PAYLOAD_DEPTH = 6
+_MAX_PAYLOAD_ITEMS = 128
+_MAX_PAYLOAD_NODES = 512
+_MAX_PAYLOAD_TEXT_CHARS = 32_768
+_MAX_PAYLOAD_VALUE_CHARS = 4_096
+_MAX_UPSERT_BATCH_RECORDS = 1_024
+_MAX_JSON_SAFE_INTEGER = (1 << 53) - 1
+_INTEGER_OUT_OF_RANGE_VALUE = "[integer-out-of-range]"
+_UNSUPPORTED_PAYLOAD_VALUE = "[unsupported]"
+_TRUNCATED_PAYLOAD_VALUE = "[truncated]"
+_IDENTITY_FIELD_KEYS = ("id", "video_id")
+_PAYLOAD_MARKER_VALUES = frozenset(
+    {
+        _INTEGER_OUT_OF_RANGE_VALUE,
+        _UNSUPPORTED_PAYLOAD_VALUE,
+        _TRUNCATED_PAYLOAD_VALUE,
+    }
+)
+_RECORD_FIELD_KEYS = (
+    *_IDENTITY_FIELD_KEYS,
+    "title",
+    "reason",
+    "reason_label",
+    "failed_at",
+    "failed_at_table",
+    "status",
+    "status_label",
+    "platform",
+    "platform_label",
+    "trace_id",
+)
+_RECORD_FIELD_PRIORITY = {key: index for index, key in enumerate(_RECORD_FIELD_KEYS)}
+
+
+def _bounded_payload_text(value: str, budget: list[int]) -> str:
+    allowed = min(_MAX_PAYLOAD_VALUE_CHARS, max(0, budget[1]))
+    try:
+        text = str.__getitem__(value, slice(0, allowed))
+    except BaseException:
+        return _UNSUPPORTED_PAYLOAD_VALUE
+    text = "".join("\ufffd" if "\ud800" <= char <= "\udfff" else char for char in text)
+    budget[1] -= len(text)
+    return text
+
+
+def _payload_sort_key(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except BaseException:
+        return _UNSUPPORTED_PAYLOAD_VALUE
+
+
+def _json_safe_identity_value(value: Any) -> Any:
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        try:
+            normalized_integer = int(value)
+        except BaseException:
+            return _UNSUPPORTED_PAYLOAD_VALUE
+        if -_MAX_JSON_SAFE_INTEGER <= normalized_integer <= _MAX_JSON_SAFE_INTEGER:
+            return normalized_integer
+        return _INTEGER_OUT_OF_RANGE_VALUE
+    if not isinstance(value, str):
+        return _UNSUPPORTED_PAYLOAD_VALUE
+    try:
+        if str.__len__(value) > _MAX_PAYLOAD_VALUE_CHARS:
+            return _TRUNCATED_PAYLOAD_VALUE
+        text = str.__getitem__(value, slice(0, _MAX_PAYLOAD_VALUE_CHARS + 1))
+    except BaseException:
+        return _UNSUPPORTED_PAYLOAD_VALUE
+    if any("\ud800" <= char <= "\udfff" for char in text):
+        return _UNSUPPORTED_PAYLOAD_VALUE
+    return text
+
+
+def _json_safe_payload_iterable(value: Iterable[Any], *, depth: int, budget: list[int]) -> Any:
+    try:
+        iterator = iter(value)
+    except BaseException:
+        return _UNSUPPORTED_PAYLOAD_VALUE
+    projected: list[Any] = []
+    for index in range(_MAX_PAYLOAD_ITEMS + 1):
+        if budget[0] <= 0 or budget[1] <= 0:
+            projected.append(_TRUNCATED_PAYLOAD_VALUE)
+            break
+        try:
+            item = next(iterator)
+        except StopIteration:
+            break
+        except BaseException:
+            return _UNSUPPORTED_PAYLOAD_VALUE
+        if index == _MAX_PAYLOAD_ITEMS:
+            projected.append(_TRUNCATED_PAYLOAD_VALUE)
+            break
+        projected.append(
+            _json_safe_payload_value(
+                item,
+                depth=depth + 1,
+                budget=budget,
+            )
+        )
+    return projected
+
+
+def _json_safe_payload_value(value: Any, *, depth: int, budget: list[int]) -> Any:
+    if budget[0] <= 0 or budget[1] <= 0:
+        return _TRUNCATED_PAYLOAD_VALUE
+    budget[0] -= 1
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        try:
+            normalized_integer = int(value)
+        except BaseException:
+            return _UNSUPPORTED_PAYLOAD_VALUE
+        if -_MAX_JSON_SAFE_INTEGER <= normalized_integer <= _MAX_JSON_SAFE_INTEGER:
+            return normalized_integer
+        return _INTEGER_OUT_OF_RANGE_VALUE
+    if isinstance(value, float):
+        return value if value == value and value not in {float("inf"), float("-inf")} else None
+    if isinstance(value, str):
+        return _bounded_payload_text(value, budget)
+    if isinstance(value, bytes):
+        try:
+            decoded = bytes.decode(value, "utf-8", errors="replace")
+        except BaseException:
+            return _UNSUPPORTED_PAYLOAD_VALUE
+        return _bounded_payload_text(decoded, budget)
+    if isinstance(value, Path):
+        try:
+            path_text = str(value)
+        except BaseException:
+            return _UNSUPPORTED_PAYLOAD_VALUE
+        return _bounded_payload_text(path_text, budget)
+    if depth >= _MAX_PAYLOAD_DEPTH:
+        return _TRUNCATED_PAYLOAD_VALUE
+    if isinstance(value, Mapping):
+        items: list[tuple[str, Any]] = []
+        seen_keys: set[str] = set()
+        for key in _RECORD_FIELD_KEYS:
+            try:
+                raw_value = value[key]
+            except BaseException:
+                continue
+            bounded_key = _bounded_payload_text(key, budget)
+            if not bounded_key:
+                break
+            items.append((bounded_key, raw_value))
+            seen_keys.add(bounded_key)
+        remaining_items = max(0, _MAX_PAYLOAD_ITEMS - len(items))
+        if remaining_items:
+            try:
+                raw_items = value.items()
+                for raw_key, raw_value in islice(raw_items, remaining_items):
+                    if isinstance(raw_key, str):
+                        key = _bounded_payload_text(raw_key, budget)
+                    elif isinstance(raw_key, (bool, int)):
+                        key = _bounded_payload_text(str(raw_key), budget)
+                    else:
+                        continue
+                    if key and key not in seen_keys:
+                        items.append((key, raw_value))
+                        seen_keys.add(key)
+            except BaseException:
+                pass
+        items.sort(
+            key=lambda item: (
+                _RECORD_FIELD_PRIORITY.get(item[0], len(_RECORD_FIELD_PRIORITY)),
+                item[0],
+            )
+        )
+        projected_mapping: dict[str, Any] = {}
+        for key, raw_value in items:
+            if depth == 0 and key in _IDENTITY_FIELD_KEYS:
+                projected_mapping[key] = _json_safe_identity_value(raw_value)
+                continue
+            if budget[0] <= 0 or budget[1] <= 0:
+                break
+            projected_mapping[key] = _json_safe_payload_value(
+                raw_value,
+                depth=depth + 1,
+                budget=budget,
+            )
+        return projected_mapping
+    if isinstance(value, (set, frozenset)):
+        try:
+            if len(value) > _MAX_PAYLOAD_ITEMS:
+                return _TRUNCATED_PAYLOAD_VALUE
+        except BaseException:
+            return _UNSUPPORTED_PAYLOAD_VALUE
+        projected = _json_safe_payload_iterable(value, depth=depth, budget=budget)
+        if not isinstance(projected, list):
+            return projected
+        return sorted(projected, key=_payload_sort_key)
+    if isinstance(value, Iterable):
+        return _json_safe_payload_iterable(value, depth=depth, budget=budget)
+    return _UNSUPPORTED_PAYLOAD_VALUE
+
+
+def _json_safe_payload(record: Mapping[str, Any]) -> dict[str, Any]:
+    budget = [_MAX_PAYLOAD_NODES, _MAX_PAYLOAD_TEXT_CHARS]
+    projected = _json_safe_payload_value(record, depth=0, budget=budget)
+    return projected if isinstance(projected, dict) else {}
+
+
+def _record_text(payload: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value[:_MAX_PAYLOAD_VALUE_CHARS]
+        if isinstance(value, (bool, int, float)):
+            return str(value)[:_MAX_PAYLOAD_VALUE_CHARS]
+    return ""
+
+
+def _record_identity_text(payload: Mapping[str, Any]) -> str:
+    for key in _IDENTITY_FIELD_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str):
+            if (
+                value
+                and value not in _PAYLOAD_MARKER_VALUES
+                and len(value) <= _MAX_PAYLOAD_VALUE_CHARS
+                and not any("\ud800" <= char <= "\udfff" for char in value)
+            ):
+                return value
+            continue
+        if isinstance(value, int) and not isinstance(value, bool):
+            if -_MAX_JSON_SAFE_INTEGER <= value <= _MAX_JSON_SAFE_INTEGER:
+                return str(value)
+    return ""
+
+
+class FailedRecordStore:
+    """后台按 video_id 合并写入，并只保留最新刷新请求，避免 UI 查询持续堆积。"""
+
+    def __init__(
+        self,
+        *,
+        db_path: str | Path | None = None,
+        clock=time.time,
+        on_refresh: Callable[[int], None] | None = None,
+        snapshot_limit: int = 500,
+    ) -> None:
+        root = Path(user_data_root()) / "cache"
+        root.mkdir(parents=True, exist_ok=True)
+        self._db_path = Path(db_path or (root / "failed_records.sqlite3"))
+        self._clock = clock
+        self._lock = threading.RLock()
+        self._init_lock = threading.RLock()
+        self._snapshot_lock = threading.RLock()
+        self._db_mutation_lock = threading.RLock()
+        self._event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._pending: dict[str, dict[str, Any]] = {}
+        self._inflight_ids: set[str] = set()
+        self._write_generation = 0
+        self._next_record_generation = 0
+        self._record_generations: dict[str, int] = {}
+        self._write_failure_count = 0
+        self._last_write_error_log_at = 0.0
+        self._write_retry_base_seconds = 0.05
+        self._write_retry_max_seconds = 1.0
+        self._write_error_log_interval_seconds = 30.0
+        initial_query = FailedRecordQuery(limit=max(1, int(snapshot_limit)), offset=0)
+        self._refresh_requested: FailedRecordQuery | None = None
+        self._prune_retention_days: int | None = None
+        self._last_refresh_request = initial_query
+        self._snapshot: list[dict[str, Any]] = []
+        self._snapshot_total_count = 0
+        self._writing = False
+        self._refreshing = False
+        self._pruning = False
+        self._shutdown = False
+        self._initialized = False
+        self._on_refresh = on_refresh
+
+    @property
+    def db_path(self) -> Path:
+        return self._db_path
+
+    def queue_upsert(self, records: Iterable[Mapping[str, Any]]) -> None:
+        """合并同 video_id 的待写入记录，避免失败列表刷新时重复写库。"""
+        try:
+            iterator = iter(records)
+        except BaseException:
+            return
+        normalized: list[dict[str, Any]] = []
+        # The limit+1 item is a truncation sentinel; it and the remaining tail are dropped.
+        for index in range(_MAX_UPSERT_BATCH_RECORDS + 1):
+            try:
+                record = next(iterator)
+            except StopIteration:
+                break
+            except BaseException:
+                break
+            if index == _MAX_UPSERT_BATCH_RECORDS:
+                break
+            try:
+                normalized_record = self._normalize_record(record)
+            except BaseException:
+                continue
+            if normalized_record.get("video_id"):
+                normalized.append(normalized_record)
+        if not normalized:
+            return
+        with self._db_mutation_lock:
+            with self._lock:
+                if self._shutdown:
+                    return
+                for record in normalized:
+                    video_id = str(record["video_id"])
+                    self._next_record_generation += 1
+                    record_generation = self._next_record_generation
+                    self._record_generations[video_id] = record_generation
+                    record["_store_generation"] = self._write_generation
+                    record["_store_record_generation"] = record_generation
+                    self._pending[video_id] = record
+                self._ensure_worker_locked()
+                self._event.set()
+
+    def query(self, *, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        """仅供维护路径同步查询；UI 应读取 records_snapshot，避免阻塞渲染线程。"""
+        return self.query_records(limit=limit, offset=offset).records
+
+    def query_records(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        platform: str = "",
+        status: str = "",
+        trace_query: str = "",
+        keyword: str = "",
+        failed_from: str = "",
+        failed_to: str = "",
+        order: str = "desc",
+    ) -> FailedRecordQueryResult:
+        """同步读取筛选后的分页结果和总数。
+
+        总数与当前页由两条独立的 SELECT 读取；并发写入时二者只构成弱一致结果，
+        可能分别反映不同瞬间的数据库状态。
+        """
+        query = self._normalize_query(
+            FailedRecordQuery(
+                limit=limit,
+                offset=offset,
+                platform=platform,
+                status=status,
+                trace_query=trace_query,
+                keyword=keyword,
+                failed_from=failed_from,
+                failed_to=failed_to,
+                order=order,
+            )
+        )
+        records, total_count = self._query_rows(query)
+        return FailedRecordQueryResult(
+            records=records,
+            total_count=total_count,
+            limit=query.limit,
+            offset=query.offset,
+        )
+
+    def set_refresh_callback(self, callback: Callable[[int], None] | None) -> None:
+        with self._lock:
+            self._on_refresh = callback
+
+    def request_refresh(
+        self,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        platform: str = "",
+        status: str = "",
+        trace_query: str = "",
+        keyword: str = "",
+        failed_from: str = "",
+        failed_to: str = "",
+        order: str = "desc",
+    ) -> None:
+        """请求后台刷新快照；查询参数会覆盖上一次失败列表筛选条件。"""
+        requested = self._normalize_query(
+            FailedRecordQuery(
+                limit=limit if limit is not None else self._last_refresh_request.limit,
+                offset=offset,
+                platform=platform,
+                status=status,
+                trace_query=trace_query,
+                keyword=keyword,
+                failed_from=failed_from,
+                failed_to=failed_to,
+                order=order,
+            )
+        )
+        with self._lock:
+            if self._shutdown:
+                return
+            self._last_refresh_request = requested
+            self._refresh_requested = requested
+            self._ensure_worker_locked()
+            self._event.set()
+
+    def request_prune(self, retention_days: int) -> None:
+        """请求后台清理过期失败记录，并在同一轮任务后刷新内存快照。"""
+        days = self._normalize_retention_days(retention_days)
+        with self._lock:
+            if self._shutdown:
+                return
+            self._prune_retention_days = days
+            self._refresh_requested = self._last_refresh_request
+            self._ensure_worker_locked()
+            self._event.set()
+
+    def records_snapshot(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        with self._snapshot_lock:
+            rows = self._snapshot if limit is None else self._snapshot[: max(0, int(limit))]
+            return deepcopy(rows)
+
+    @property
+    def snapshot_total_count(self) -> int:
+        with self._snapshot_lock:
+            return int(self._snapshot_total_count)
+
+    def flush(self, timeout: float = 2.0) -> bool:
+        """在给定时限内观察写入、刷新和清理任务是否清空，并返回观察结果。
+
+        本方法只等待现有后台工作，不主动建立关闭屏障；``shutdown`` 也不调用它，
+        因而不能据此推断关闭一定排空。
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while time.monotonic() < deadline:
+            with self._lock:
+                pending = bool(self._pending)
+                writing = self._writing
+                refreshing = self._refreshing
+                pruning = self._pruning
+                refresh_requested = self._refresh_requested is not None
+                prune_requested = self._prune_retention_days is not None
+            if not pending and not writing and not refreshing and not pruning and not refresh_requested and not prune_requested:
+                return True
+            time.sleep(0.01)
+        with self._lock:
+            return (
+                not self._pending
+                and not self._writing
+                and not self._refreshing
+                and not self._pruning
+                and self._refresh_requested is None
+                and self._prune_retention_days is None
+            )
+
+    def record_by_id(self, video_id: str) -> dict[str, Any] | None:
+        normalized_id = str(video_id or "").strip()
+        if not normalized_id:
+            return None
+        self._init_db()
+        with self._open_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT video_id, title, reason, failed_at, status, platform, trace_id, payload_json, updated_at
+                FROM failed_records
+                WHERE video_id = ?
+                LIMIT 1
+                """,
+                (normalized_id,),
+            ).fetchone()
+        return self._row_to_record(row) if row is not None else None
+
+    def delete_record(self, video_id: str) -> bool:
+        normalized_id = str(video_id or "").strip()
+        if not normalized_id:
+            return False
+        with self._db_mutation_lock:
+            self._init_db()
+            with self._open_connection() as conn:
+                cursor = conn.execute("DELETE FROM failed_records WHERE video_id = ?", (normalized_id,))
+                conn.commit()
+                deleted = int(cursor.rowcount or 0) > 0
+            # Make the user mutation win over a queued or already-dispatched stale upsert.
+            with self._lock:
+                pending = self._pending.pop(normalized_id, None) is not None
+                inflight = normalized_id in self._inflight_ids
+                if inflight:
+                    self._next_record_generation += 1
+                    self._record_generations[normalized_id] = self._next_record_generation
+        snapshot_changed, visible_count, total_count = self._remove_from_snapshot(normalized_id, deleted=deleted)
+        if snapshot_changed:
+            self._notify_refresh(visible_count, total_count)
+        self._refresh_after_mutation()
+        return deleted or pending or inflight
+
+    def clear_records(self) -> int:
+        with self._db_mutation_lock:
+            self._init_db()
+            with self._open_connection() as conn:
+                cursor = conn.execute("DELETE FROM failed_records")
+                conn.commit()
+                deleted_count = max(0, int(cursor.rowcount or 0))
+            with self._lock:
+                self._write_generation += 1
+                self._pending.clear()
+        with self._snapshot_lock:
+            snapshot_changed = bool(self._snapshot or self._snapshot_total_count)
+            self._snapshot = []
+            self._snapshot_total_count = 0
+        if snapshot_changed:
+            self._notify_refresh(0, 0)
+        self._refresh_after_mutation()
+        return deleted_count
+
+    def prune_expired(self, retention_days: int) -> int:
+        days = self._normalize_retention_days(retention_days)
+        cutoff_dt = datetime.now() - timedelta(days=days)
+        cutoff_text = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_ts = cutoff_dt.timestamp()
+        self._init_db()
+        with self._open_connection() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM failed_records
+                WHERE
+                    (length(COALESCE(failed_at, '')) >= 19 AND failed_at < ?)
+                    OR (length(COALESCE(failed_at, '')) < 19 AND updated_at < ?)
+                """,
+                (cutoff_text, cutoff_ts),
+            )
+            conn.commit()
+            deleted_count = max(0, int(cursor.rowcount or 0))
+        if deleted_count:
+            self._refresh_after_mutation()
+        return deleted_count
+
+    def shutdown(self, timeout: float = 1.0) -> bool:
+        """关闭新任务准入，并等待已经接收的后台工作排空。
+
+        超时只限制调用方等待时间；后台守护线程仍会继续持有并完成已接收的写入、
+        刷新和清理请求。返回值用于让生命周期所有者识别尚未完成的关闭。
+        """
+        wait_timeout = max(0.0, float(timeout))
+        with self._lock:
+            self._shutdown = True
+            if self._has_queued_work_locked():
+                self._ensure_worker_locked()
+            self._event.set()
+            thread = self._thread
+        if thread is None:
+            return True
+        if thread is threading.current_thread():
+            return False
+        if thread.is_alive():
+            thread.join(timeout=wait_timeout)
+        with self._lock:
+            return not thread.is_alive() and self._is_drained_locked()
+
+    def _ensure_worker_locked(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._worker_loop, name="failed-record-store", daemon=True)
+        self._thread.start()
+
+    def _worker_loop(self) -> None:
+        """串行处理写入和刷新，避免 SQLite 写锁与 UI 查询互相打架。"""
+        while True:
+            self._event.wait()
+            with self._lock:
+                batch = list(self._pending.values())
+                self._pending.clear()
+                batch_ids = {str(record.get("video_id") or "") for record in batch}
+                self._inflight_ids.update(batch_ids)
+                refresh_request = self._refresh_requested
+                self._refresh_requested = None
+                prune_retention_days = self._prune_retention_days
+                self._prune_retention_days = None
+                if batch and refresh_request is None:
+                    refresh_request = self._last_refresh_request
+                if prune_retention_days is not None and refresh_request is None:
+                    refresh_request = self._last_refresh_request
+                self._event.clear()
+                self._writing = bool(batch)
+                self._pruning = prune_retention_days is not None
+                self._refreshing = refresh_request is not None
+            if not batch and prune_retention_days is None and refresh_request is None:
+                with self._lock:
+                    work_remaining = self._has_queued_work_locked()
+                    should_exit = self._shutdown and not work_remaining
+                    if work_remaining:
+                        self._event.set()
+                if should_exit:
+                    return
+                continue
+            try:
+                write_failed = False
+                if batch:
+                    try:
+                        self._write_batch(batch)
+                    except BaseException as exc:
+                        write_failed = True
+                        retry_delay, should_log = self._restore_failed_batch(batch)
+                        if should_log:
+                            self._log_write_failure_best_effort(exc, len(batch))
+                        self._wait_before_write_retry(retry_delay)
+                    else:
+                        self._reset_write_retry_state()
+                if prune_retention_days is not None:
+                    try:
+                        deleted_count = self.prune_expired(prune_retention_days)
+                        if deleted_count:
+                            self._log_best_effort(
+                                "failed_record_prune",
+                                message_factory=lambda: f"Pruned {deleted_count} expired failed records",
+                                details_factory=lambda: {
+                                    "count": int(deleted_count),
+                                    "retention_days": int(prune_retention_days),
+                                },
+                            )
+                    except Exception as exc:
+                        self._log_exception_best_effort(
+                            "prune_expired",
+                            exc,
+                            details_factory=lambda: {
+                                "retention_days": int(prune_retention_days),
+                                "db_path": str(self._db_path),
+                            },
+                        )
+                    except BaseException as exc:
+                        self._log_exception_best_effort(
+                            "prune_expired",
+                            exc,
+                            details_factory=lambda: {
+                                "retention_days": int(prune_retention_days),
+                                "db_path": str(self._db_path),
+                            },
+                        )
+                if refresh_request is not None and not write_failed:
+                    try:
+                        self._refresh_snapshot(refresh_request)
+                    except BaseException as exc:
+                        self._log_exception_best_effort(
+                            "refresh_snapshot_unhandled",
+                            exc,
+                            details_factory=lambda: {
+                                "query": refresh_request.__dict__,
+                                "db_path": str(self._db_path),
+                            },
+                        )
+            finally:
+                with self._lock:
+                    self._inflight_ids.difference_update(batch_ids)
+                    for video_id in batch_ids:
+                        if video_id not in self._pending:
+                            self._record_generations.pop(video_id, None)
+                    self._writing = False
+                    self._refreshing = False
+                    self._pruning = False
+                    work_remaining = self._has_queued_work_locked()
+                    should_exit = self._shutdown and not work_remaining
+                    if work_remaining:
+                        self._event.set()
+                if should_exit:
+                    return
+
+    def _has_queued_work_locked(self) -> bool:
+        return bool(
+            self._pending
+            or self._refresh_requested is not None
+            or self._prune_retention_days is not None
+        )
+
+    def _is_drained_locked(self) -> bool:
+        return bool(
+            not self._pending
+            and not self._writing
+            and not self._refreshing
+            and not self._pruning
+            and self._refresh_requested is None
+            and self._prune_retention_days is None
+        )
+
+    def _restore_failed_batch(self, batch: list[dict[str, Any]]) -> tuple[float, bool]:
+        now = time.monotonic()
+        with self._lock:
+            for record in batch:
+                video_id = str(record.get("video_id") or "")
+                if not video_id:
+                    continue
+                if int(record.get("_store_generation", -1)) != self._write_generation:
+                    continue
+                if int(record.get("_store_record_generation", -1)) != self._record_generations.get(video_id, 0):
+                    continue
+                self._pending.setdefault(video_id, record)
+            self._write_failure_count += 1
+            retry_power = min(self._write_failure_count - 1, 8)
+            retry_delay = min(
+                max(0.0, float(self._write_retry_max_seconds)),
+                max(0.0, float(self._write_retry_base_seconds)) * (2**retry_power),
+            )
+            log_interval = max(0.0, float(self._write_error_log_interval_seconds))
+            should_log = (
+                self._write_failure_count == 1
+                or now - self._last_write_error_log_at >= log_interval
+            )
+            if should_log:
+                self._last_write_error_log_at = now
+            retry_needed = bool(self._pending)
+        return (retry_delay if retry_needed else 0.0), should_log
+
+    def _reset_write_retry_state(self) -> None:
+        with self._lock:
+            self._write_failure_count = 0
+            self._last_write_error_log_at = 0.0
+
+    def _log_write_failure_best_effort(self, exc: BaseException, count: int) -> None:
+        self._log_exception_best_effort(
+            "write_batch",
+            exc,
+            details_factory=lambda: {
+                "count": int(count),
+                "db_path": str(self._db_path),
+            },
+        )
+
+    @staticmethod
+    def _log_best_effort(
+        action: str,
+        *,
+        message_factory: Callable[[], str],
+        details_factory: Callable[[], Mapping[str, Any]],
+    ) -> None:
+        try:
+            debug_logger.log(
+                "FailedRecordStore",
+                action,
+                message=message_factory(),
+                details=details_factory(),
+            )
+        except BaseException:
+            return
+
+    @staticmethod
+    def _log_exception_best_effort(
+        action: str,
+        exc: BaseException,
+        *,
+        details_factory: Callable[[], Mapping[str, Any]],
+    ) -> None:
+        try:
+            debug_logger.log_exception(
+                "FailedRecordStore",
+                action,
+                exc,
+                details=details_factory(),
+            )
+        except BaseException:
+            return
+
+    @staticmethod
+    def _wait_before_write_retry(delay: float) -> None:
+        if delay <= 0:
+            return
+        try:
+            time.sleep(delay)
+        except BaseException:
+            return
+
+    @contextmanager
+    def _open_connection(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(self._db_path, timeout=5.0)) as conn:
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute("PRAGMA synchronous = FULL")
+            yield conn
+
+    def _init_db(self) -> None:
+        if self._initialized:
+            return
+        with self._init_lock:
+            if self._initialized:
+                return
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            with closing(sqlite3.connect(self._db_path, timeout=5.0)) as conn:
+                conn.execute("PRAGMA busy_timeout = 5000")
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("PRAGMA synchronous = FULL")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS failed_records (
+                        video_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        reason TEXT,
+                        failed_at TEXT,
+                        status TEXT,
+                        platform TEXT,
+                        trace_id TEXT,
+                        payload_json TEXT NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_failed_records_failed_at ON failed_records(failed_at)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_failed_records_trace_id ON failed_records(trace_id)")
+                conn.commit()
+            self._initialized = True
+
+    def _query_rows(self, query: FailedRecordQuery) -> tuple[list[dict[str, Any]], int]:
+        self._init_db()
+        where_sql, params = self._build_where_clause(query)
+        order_sql = "ASC" if query.order == "asc" else "DESC"
+        # SQL 片段只来自固定列条件和 order 枚举；用户值仍通过绑定参数传入。
+        rows_sql = (
+            "SELECT video_id, title, reason, failed_at, status, platform, trace_id, payload_json, updated_at "
+            f"FROM failed_records {where_sql} "
+            "ORDER BY COALESCE(NULLIF(failed_at, ''), printf('%020.6f', updated_at)) "
+            f"{order_sql} LIMIT ? OFFSET ?"
+        )
+        rows: list[sqlite3.Row]
+        with self._open_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            total_count = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM failed_records {where_sql}",  # nosec B608
+                    params,
+                ).fetchone()[0]
+            )
+            rows = list(
+                conn.execute(
+                    rows_sql,
+                    (*params, query.limit, query.offset),
+                )
+            )
+        return [self._row_to_record(row) for row in rows], total_count
+
+    def _refresh_snapshot(self, request: FailedRecordQuery) -> None:
+        """根据最近一次查询刷新内存快照，并只在内容变化时通知前端。"""
+        try:
+            rows, total_count = self._query_rows(request)
+        except BaseException as exc:
+            self._log_exception_best_effort(
+                "refresh_snapshot",
+                exc,
+                details_factory=lambda: {
+                    "query": request.__dict__,
+                    "db_path": str(self._db_path),
+                },
+            )
+            return
+        with self._snapshot_lock:
+            changed = rows != self._snapshot or total_count != self._snapshot_total_count
+            self._snapshot = rows
+            self._snapshot_total_count = total_count
+        if not changed:
+            return
+        self._notify_refresh(len(rows), total_count)
+
+    def _write_batch(self, records: list[dict[str, Any]]) -> None:
+        """在单个连接中 executemany 整批 upsert，并在批末一次提交。
+
+        该事务只覆盖本批有效记录，不包含随后执行的清理或内存快照刷新；
+        ``payload_json`` 保留详情字段。
+        """
+        with self._db_mutation_lock:
+            with self._lock:
+                generation = self._write_generation
+                records = [
+                    record
+                    for record in records
+                    if int(record.get("_store_generation", -1)) == generation
+                    and int(record.get("_store_record_generation", -1))
+                    == self._record_generations.get(str(record.get("video_id") or ""), 0)
+                ]
+            if not records:
+                return
+            self._init_db()
+            now = float(self._clock())
+            payloads = [
+                (
+                    str(record.get("video_id") or ""),
+                    str(record.get("title") or ""),
+                    str(record.get("reason") or ""),
+                    str(record.get("failed_at") or ""),
+                    str(record.get("status") or ""),
+                    str(record.get("platform") or ""),
+                    str(record.get("trace_id") or ""),
+                    str(record.get("payload_json") or "{}"),
+                    now,
+                )
+                for record in records
+                if record.get("video_id")
+            ]
+            with self._open_connection() as conn:
+                conn.executemany(
+                """
+                INSERT INTO failed_records(
+                    video_id, title, reason, failed_at, status, platform, trace_id, payload_json, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(video_id) DO UPDATE SET
+                    title=excluded.title,
+                    reason=excluded.reason,
+                    failed_at=excluded.failed_at,
+                    status=excluded.status,
+                    platform=excluded.platform,
+                    trace_id=excluded.trace_id,
+                    payload_json=excluded.payload_json,
+                    updated_at=excluded.updated_at
+                """,
+                    payloads,
+                )
+                conn.commit()
+
+    def _remove_from_snapshot(self, video_id: str, *, deleted: bool) -> tuple[bool, int, int]:
+        with self._snapshot_lock:
+            remaining = [
+                row
+                for row in self._snapshot
+                if str(row.get("id") or row.get("video_id") or "") != video_id
+            ]
+            removed = len(remaining) != len(self._snapshot)
+            self._snapshot = remaining
+            query = self._last_refresh_request
+            unfiltered = not any(
+                (query.platform, query.status, query.trace_query, query.keyword, query.failed_from, query.failed_to)
+            )
+            changed = removed or (deleted and unfiltered)
+            if changed:
+                self._snapshot_total_count = max(0, self._snapshot_total_count - 1)
+            return changed, len(self._snapshot), self._snapshot_total_count
+
+    def _notify_refresh(self, count: int, total_count: int) -> None:
+        callback = self._on_refresh
+        if callback is None:
+            return
+        try:
+            callback(int(count))
+        except BaseException as exc:
+            self._log_exception_best_effort(
+                "refresh_callback",
+                exc,
+                details_factory=lambda: {
+                    "count": int(count),
+                    "total_count": int(total_count),
+                },
+            )
+
+    @staticmethod
+    def _normalize_record(record: Mapping[str, Any]) -> dict[str, Any]:
+        """把不同前端投影字段统一到失败记录表字段。"""
+        payload = _json_safe_payload(record)
+        try:
+            payload_json = json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except BaseException:
+            payload_json = "{}"
+        return {
+            "video_id": _record_identity_text(payload),
+            "title": _record_text(payload, "title"),
+            "reason": _record_text(payload, "reason", "reason_label"),
+            "failed_at": _record_text(payload, "failed_at", "failed_at_table"),
+            "status": _record_text(payload, "status", "status_label"),
+            "platform": _record_text(payload, "platform", "platform_label"),
+            "trace_id": _record_text(payload, "trace_id"),
+            "payload": payload,
+            "payload_json": payload_json,
+        }
+
+    @staticmethod
+    def _normalize_query(query: FailedRecordQuery) -> FailedRecordQuery:
+        try:
+            limit = int(query.limit)
+        except (TypeError, ValueError):
+            limit = 100
+        try:
+            offset = int(query.offset)
+        except (TypeError, ValueError):
+            offset = 0
+        order = str(query.order or "desc").lower()
+        if order not in {"asc", "desc"}:
+            order = "desc"
+        return FailedRecordQuery(
+            limit=max(1, min(limit, 5000)),
+            offset=max(0, offset),
+            platform=str(query.platform or "").strip(),
+            status=str(query.status or "").strip(),
+            trace_query=str(query.trace_query or "").strip(),
+            keyword=str(query.keyword or "").strip(),
+            failed_from=str(query.failed_from or "").strip(),
+            failed_to=str(query.failed_to or "").strip(),
+            order=order,
+        )
+
+    @staticmethod
+    def _normalize_retention_days(value: Any) -> int:
+        try:
+            days = int(value)
+        except (TypeError, ValueError):
+            days = 7
+        return max(1, min(days, 365))
+
+    def _refresh_after_mutation(self) -> None:
+        with self._lock:
+            if self._shutdown:
+                return
+            self._refresh_requested = self._last_refresh_request
+            self._ensure_worker_locked()
+            self._event.set()
+
+    @staticmethod
+    def _build_where_clause(query: FailedRecordQuery) -> tuple[str, tuple[Any, ...]]:
+        """按筛选项构造参数化 WHERE，避免拼接用户输入到 SQL。"""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if query.platform:
+            clauses.append("platform = ?")
+            params.append(query.platform)
+        if query.status:
+            clauses.append("status = ?")
+            params.append(query.status)
+        if query.trace_query:
+            clauses.append("trace_id LIKE ?")
+            params.append(f"%{query.trace_query}%")
+        if query.failed_from:
+            clauses.append("failed_at >= ?")
+            params.append(query.failed_from)
+        if query.failed_to:
+            clauses.append("failed_at <= ?")
+            params.append(query.failed_to)
+        if query.keyword:
+            like = f"%{query.keyword}%"
+            clauses.append("(title LIKE ? OR reason LIKE ? OR payload_json LIKE ?)")
+            params.extend([like, like, like])
+        if not clauses:
+            return "", ()
+        return "WHERE " + " AND ".join(clauses), tuple(params)
+
+    @staticmethod
+    def _row_to_record(row: sqlite3.Row) -> dict[str, Any]:
+        """把数据库行还原成前端记录；表字段覆盖旧 payload 中的派生值。"""
+        payload: dict[str, Any]
+        try:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+        except json.JSONDecodeError:
+            payload = {}
+        result = dict(payload)
+        result.update(
+            {
+                "id": str(row["video_id"] or payload.get("id") or ""),
+                "title": str(row["title"] or payload.get("title") or ""),
+                "reason": str(row["reason"] or payload.get("reason") or ""),
+                "failed_at": str(row["failed_at"] or payload.get("failed_at") or ""),
+                "status": str(row["status"] or payload.get("status") or ""),
+                "platform": str(row["platform"] or payload.get("platform") or ""),
+                "trace_id": str(row["trace_id"] or payload.get("trace_id") or ""),
+                "updated_at": float(row["updated_at"] or 0.0),
+            }
+        )
+        return result

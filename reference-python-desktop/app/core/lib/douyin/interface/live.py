@@ -1,0 +1,102 @@
+"""通过 web_rid 或 room_id 获取抖音直播间数据。"""
+
+from typing import TYPE_CHECKING, Union
+from .template import API, CHROME_VERSION
+
+try:
+    from ..tools import DownloaderError
+except ImportError:
+    class DownloaderError(Exception):
+
+        pass
+
+if TYPE_CHECKING:
+    from typing import Any
+    Parameter = Any
+    Params = Any
+
+class Live(API):
+    """根据入口标识选择直播页接口或分享回流接口。"""
+    
+    live_api = "https://live.douyin.com/webcast/room/web/enter/"
+    live_api_share = "https://webcast.amemv.com/webcast/room/reflow/info/"
+
+    def __init__(
+        self,
+        params: Union["Parameter", "Params"],
+        cookie: str = "",
+        proxy: str = None,
+        web_rid: str = ...,
+        room_id: str = ...,
+        sec_user_id: str = "",
+    ):
+        super().__init__(params, cookie, proxy)
+        self.black_headers = params.headers_download
+        self.web_rid = web_rid
+        self.room_id = room_id
+        self.sec_user_id = sec_user_id
+
+    async def run(
+        self,
+        *args,
+        **kwargs,
+    ) -> dict:
+        """优先按 web_rid 请求；缺失时退回 room_id，否则抛出 DownloaderError。"""
+        if isinstance(self.web_rid, str):
+            return await self.with_web_rid()
+        elif self.room_id:
+            return await self.with_room_id()
+        else:
+            raise DownloaderError
+
+    async def with_web_rid(self) -> dict:
+        
+        self.set_referer("https://live.douyin.com/")
+        # 直播页请求参数基本固定，只有房间标识会随入口变化。
+        params = {
+            "aid": "6383",
+            "app_name": "douyin_web",
+            "live_id": "1",
+            "device_platform": "web",
+            "language": "zh-CN",
+            "enter_from": "web_share_link",
+            "cookie_enabled": "true",
+            "screen_width": "1536",
+            "screen_height": "864",
+            "browser_language": "zh-CN",
+            "browser_platform": "Win32",
+            "browser_name": "Edge",
+            "browser_version": CHROME_VERSION,
+            "web_rid": self.web_rid,
+            "enter_source": "",
+            "is_need_double_stream": "false",
+            "insert_task_id": "",
+            "live_reason": "",
+        }
+        return await self.request_data(
+            self.live_api,
+            params,
+        )
+
+    async def with_room_id(self) -> dict:
+        
+        params = {
+            "type_id": "0",
+            "live_id": "1",
+            "room_id": self.room_id,
+            "sec_user_id": self.sec_user_id,
+            "app_id": "1128",
+        }
+        return await self.request_data(
+            self.live_api_share,
+            params,
+            headers=self.black_headers,
+        )
+
+async def test():
+    
+    pass
+
+if __name__ == "__main__":
+    from asyncio import run
+    run(test())

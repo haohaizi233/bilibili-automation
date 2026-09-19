@@ -1,0 +1,2644 @@
+"""GUI/WebUI 统一前端状态适配层。
+
+本服务不依赖具体传输；GUI 组件和 Web 静态端只消费同形快照，
+不直接读取 spider、downloader、parser 或任务构建器。
+"""
+
+from __future__ import annotations
+
+import functools
+import os
+import threading
+import time
+from collections import deque
+from contextlib import contextmanager
+from copy import deepcopy
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from app.config import cfg
+from app.config.settings import CURRENT_FILENAME_TEMPLATE, get_setting_default
+from app.core.plugins.run_options import build_missav_proxy_url
+from app.exceptions import ConfigValidationError, ConfigWriteError
+from app.debug_logger import debug_logger
+from app.core.plugin_registry import registry
+from app.core.state import VideoStatus, parse_video_status
+from app.models import VideoItem
+from app.services.app_state import AppState
+from app.services.cache_service import CacheService
+from app.services import frontend_settings_adapter as settings_adapter
+from app.services.frontend_event_aggregator import (
+    ALL_FRONTEND_SECTIONS,
+    VIDEO_SECTIONS,
+    FrontendEventAggregator,
+    sections_for_topic,
+)
+from app.services.failed_record_store import FailedRecordStore
+from app.services import completed_metadata_rules as metadata_rules
+from app.services import frontend_file_actions as file_actions
+from app.services import frontend_log_adapter as log_adapter
+from app.services import frontend_status_adapter as status_adapter
+from app.services import frontend_video_adapter as video_adapter
+from shared.icon_contract import icon_manifest
+from shared.log_contract import log_contract
+from shared.frontend_page_definitions import PAGE_DEFINITIONS
+from app.services.frontend_log_cache import FrontendLogCache
+from app.services.media_metadata_service import MediaMetadata, MediaMetadataService
+from app.services.metadata_probe_queue import MetadataProbeQueue
+from app.services.metadata_retry_tracker import MetadataRetryTracker
+from app.services.tool_runner_service import ToolRunnerService
+from app.services.frontend_action_result import FrontendActionResult
+from app.services.frontend_link_candidate_admission import handle_frontend_link_candidate_admission
+from app.services.frontend_state_shutdown import destroy_frontend_state_service
+from app.services.frontend_toolbox_state import FrontendToolboxStateMixin
+from app.utils.filenames import sanitize_filename
+from app.utils.safe_slot import safe_slot
+from shared.settings_metadata import GROUP_DESCRIPTIONS, GROUP_HINTS, GROUP_ICONS
+from shared.failed_page_projection import prepare_failed_item_for_display
+from shared.execution_profile import ExecutionProfile
+from shared.release_identity import load_runtime_release_identity
+
+QUEUE_STATUSES = video_adapter.QUEUE_STATUSES
+UI_TITLE_STAGE_META_KEY = "ui_title_stage"
+UI_TITLE_TEMPLATE_META_KEY = "ui_title_template"
+DOWNLOAD_AUTO_RETRY_CACHE_KEY = "download.auto_retry"
+
+
+class _HeadlessGuiRuntimeAdapter:
+    """Web 运行时未安装 Qt 时使用的直接调用适配器；它不声称拥有 QObject。"""
+
+    @staticmethod
+    def is_gui_thread() -> bool:
+        return threading.current_thread() is threading.main_thread()
+
+    @staticmethod
+    def create_invoker() -> None:
+        return None
+
+    @staticmethod
+    def owns_qobject(_value: Any) -> bool:
+        return False
+
+
+
+class FrontendStateService(FrontendToolboxStateMixin):
+    """构建 GUI/WebUI 共用的七页快照，并负责把状态变更压缩成增量事件。"""
+
+    METADATA_PROBES_PER_SNAPSHOT = 64
+    METADATA_EMPTY_MAX_RETRIES = 3
+    FRONTEND_DELTA_EVENTS_LIMIT = 64
+    FILE_LOG_BACKFILL_LIMIT = 500
+    FAILED_RECORD_SNAPSHOT_LIMIT = 500
+    PLATFORM_AUTH_REFRESH_TTL_SECONDS = 60.0
+    APP_STATE_PENDING_EVENTS_LIMIT = 4096
+    APP_STATE_ASYNC_DELIVERY_TIMEOUT_SECONDS = 0.2
+    GUI_RUNTIME_APPLY_TIMEOUT_SECONDS = 1.0
+    def __init__(
+        self,
+        controller: Any | None = None,
+        config_manager=cfg,
+        *,
+        app_state: AppState | None = None,
+        cache_service: CacheService | None = None,
+        directory_opener: Callable[[str], None] | None = None,
+        association_service_factory: Callable[[], Any] | None = None,
+        executable_path_provider: Callable[[], str] | None = None,
+        media_metadata_service: MediaMetadataService | None = None,
+        frontend_event_emitter: Callable[[str, dict[str, Any]], None] | None = None,
+        failed_record_store: FailedRecordStore | None = None,
+        gui_runtime_adapter: Any | None = None,
+        tool_runner_service: ToolRunnerService | None = None,
+        execution_profile: ExecutionProfile | None = None,
+        execution_profile_provider: Callable[[], ExecutionProfile] | None = None,
+        link_candidate_admission_coordinator: Any | None = None,
+    ) -> None:
+        self.controller = controller
+        self.config = config_manager
+        self._config_runtime_capture_local = threading.local()
+        self._owns_app_state = app_state is None
+        self.app_state = app_state if app_state is not None else AppState()
+        self.cache_service = cache_service or self.app_state.cache_service
+        self._directory_opener = directory_opener or self._open_directory_with_system
+        self._association_service_factory = association_service_factory
+        self._executable_path_provider = executable_path_provider or self._current_executable_path
+        self._download_runtime_options: dict[str, Any] = {
+            "auto_retry": self._load_download_auto_retry(),
+        }
+        self._owns_media_metadata_service = media_metadata_service is None
+        self.media_metadata_service = media_metadata_service or MediaMetadataService()
+        self._frontend_event_emitter = frontend_event_emitter
+        self._destroyed = False
+        self._destroy_lock = threading.RLock()
+        self._shutdown_completed = False
+        self._shutdown_completed_steps: set[str] = set()
+        self.failed_record_store = failed_record_store or FailedRecordStore()
+        self._failed_record_write_signatures: dict[str, tuple[Any, ...]] = {}
+        self._failed_log_excerpt_cache: dict[str, tuple[tuple[str, str, str], list[dict[str, Any]]]] = {}
+        self._gui_runtime_adapter = (
+            gui_runtime_adapter if gui_runtime_adapter is not None else _HeadlessGuiRuntimeAdapter()
+        )
+        self._gui_runtime_invoker = self._create_gui_runtime_invoker()
+        self._file_log_cache_store = FrontendLogCache(
+            cache_service=self.cache_service,
+            log_path_provider=self._latest_debug_log_path,
+            limit_provider=self._ui_log_display_limit,
+            ttl_seconds=1.0,
+            backfill_limit=self.FILE_LOG_BACKFILL_LIMIT,
+            worker_enabled=True,
+            on_refresh=self._on_file_log_cache_refreshed,
+        )
+        self._running_state = "空闲中"
+        self._static_snapshot_cache: dict[str, Any] | None = None
+        self._platform_auth_cache: dict[str, dict[str, Any]] = {}
+        self._platform_auth_force_refresh_once = False
+        self._delta_lock = threading.RLock()
+        self._event_aggregator = FrontendEventAggregator()
+        self._initialize_tool_execution_profile(execution_profile, execution_profile_provider)
+        self._owns_tool_runner_service = tool_runner_service is None
+        self.tool_runner_service = tool_runner_service or ToolRunnerService(
+            event_callback=self._emit_frontend_event,
+            settings_provider=self._tool_settings_snapshot,
+            services={
+                "controller": self.controller,
+                "media_metadata_service": self.media_metadata_service,
+            },
+        )
+        self._link_candidate_admission_coordinator = link_candidate_admission_coordinator
+        # AppState 可能异步投递事件；先排队，再在构建快照/增量前统一落到聚合器。
+        self._pending_app_state_events: deque[Any] = deque()
+        self._pending_app_state_events_overflowed = False
+        self._active_event_time_cache: dict[str, str] = {}
+        self._metadata_retry_tracker = MetadataRetryTracker(
+            retry_callback=lambda video_id, source_path: self._retry_completed_metadata_probe(video_id, source_path),
+            event_callback=lambda topic, payload: self._emit_frontend_event(topic, payload),
+            key_factory=self._metadata_failure_key,
+            max_retries_provider=lambda: max(1, int(getattr(self, "METADATA_EMPTY_MAX_RETRIES", 3) or 3)),
+            delay_provider=lambda: float(getattr(self.media_metadata_service, "EMPTY_RETRY_SECONDS", 30.0) or 30.0),
+            timer_factory=threading.Timer,
+        )
+        self._metadata_probe_scheduler = MetadataProbeQueue(
+            retry_callback=lambda video_id, source_path: self._retry_completed_metadata_probe(video_id, source_path),
+            key_factory=self._metadata_failure_key,
+            batch_size_provider=lambda: max(1, int(getattr(self, "METADATA_PROBES_PER_SNAPSHOT", 64) or 64)),
+            closed_checker=lambda: self._destroyed,
+            timer_factory=threading.Timer,
+        )
+        self._metadata_probe_budget_remaining: int | None = None
+        subscribe_app_state_async = getattr(self.app_state.event_bus, "subscribe_async", None)
+        subscribe_app_state = (
+            subscribe_app_state_async
+            if callable(subscribe_app_state_async)
+            else self.app_state.event_bus.subscribe
+        )
+        self._app_state_event_handler = subscribe_app_state(
+            "app_state.changed",
+            self._queue_app_state_change,
+        )
+        subscribe = getattr(self.config, "subscribe", None)
+        subscribe_async = getattr(self.config, "subscribe_async", None)
+        # 设置动作本就在 frontend worker 或 Web executor 上执行；提交观察器保持同步，
+        # 这样运行时副作用会在动作返回前恰好完成一次。
+        if callable(subscribe):
+            self._config_event_handler = subscribe("config.changed", self._on_config_changed)
+        elif callable(subscribe_async):
+            self._config_event_handler = subscribe_async("config.changed", self._on_config_changed)
+        else:
+            self._config_event_handler = None
+        self._config_events_drive_runtime = self._config_event_handler is not None
+        self._config_external_sync_started = False
+        start_external_sync = getattr(self.config, "start_external_sync", None)
+        if callable(start_external_sync):
+            start_external_sync()
+            self._config_external_sync_started = True
+        self._wire_failed_record_store()
+        self._apply_logging_runtime_settings(cleanup_old_logs=True)
+        self.flush_pending_app_state_events()
+
+    def _load_download_auto_retry(self) -> bool:
+        try:
+            return bool(self.cache_service.get(DOWNLOAD_AUTO_RETRY_CACHE_KEY, True))
+        except Exception as exc:
+            debug_logger.log_exception(
+                "FrontendStateService",
+                "load_download_auto_retry",
+                exc,
+            )
+            return True
+
+    def _download_runtime_get(self, key: str, default: Any = None) -> Any:
+        if key == DOWNLOAD_AUTO_RETRY_CACHE_KEY:
+            return self._download_runtime_options.get("auto_retry", default)
+        return self._download_runtime_options.get(key, default)
+
+    def _wire_failed_record_store(self) -> None:
+        set_refresh_callback = getattr(self.failed_record_store, "set_refresh_callback", None)
+        if callable(set_refresh_callback):
+            try:
+                set_refresh_callback(self._on_failed_record_store_refreshed)
+            except Exception as exc:
+                debug_logger.log_exception(
+                    "FrontendStateService",
+                    "failed_record_store.set_refresh_callback",
+                    exc,
+                )
+        self._request_failed_record_refresh()
+
+    def _request_failed_record_refresh(self) -> None:
+        request_refresh = getattr(self.failed_record_store, "request_refresh", None)
+        if not callable(request_refresh):
+            return
+        try:
+            request_refresh(limit=self.FAILED_RECORD_SNAPSHOT_LIMIT)
+        except TypeError:
+            try:
+                request_refresh()
+            except Exception as exc:
+                debug_logger.log_exception(
+                    "FrontendStateService",
+                    "failed_record_store.request_refresh",
+                    exc,
+                )
+        except Exception as exc:
+            debug_logger.log_exception(
+                "FrontendStateService",
+                "failed_record_store.request_refresh",
+                exc,
+            )
+
+    def _on_failed_record_store_refreshed(self, count: int) -> None:
+        if self._destroyed:
+            return
+        self.record_event("failed_records.refresh", {"count": int(count)})
+
+    def _is_qt_gui_thread(self) -> bool:
+        return bool(self._gui_runtime_adapter.is_gui_thread())
+
+    def _create_gui_runtime_invoker(self):
+        return self._gui_runtime_adapter.create_invoker()
+
+    def bind_controller(self, controller: Any) -> None:
+        if self._destroyed:
+            return
+        self.controller = controller
+        snapshot = getattr(controller, "_video_items_snapshot", None)
+        if callable(snapshot):
+            self.app_state.replace_videos(snapshot())
+            return
+        snapshot_videos = getattr(self.app_state, "snapshot_videos", None)
+        if callable(snapshot_videos):
+            self.app_state.replace_videos(snapshot_videos())
+
+    def set_frontend_event_emitter(self, emitter: Callable[[str, dict[str, Any]], None] | None) -> None:
+        if self._destroyed:
+            return
+        self._frontend_event_emitter = emitter
+
+    def set_running(self, is_running: bool) -> None:
+        if self._destroyed:
+            return
+        self._running_state = "运行中" if is_running else "空闲中"
+        self.app_state.set_running_state(self._running_state)
+
+    def record_log(self, message: str, *, level: str = "INFO", source: str = "GUI", trace_id: str = "") -> None:
+        if self._destroyed:
+            return
+        with self._delta_lock:
+            self.app_state.record_log(message, level=level, source=source, trace_id=trace_id)
+            self._event_aggregator.record(
+                "logs.append",
+                {"message": message, "level": level, "source": source, "trace_id": trace_id},
+                sections=sections_for_topic("logs.append"),
+            )
+
+    def upsert_video(self, item: VideoItem) -> None:
+        if self._destroyed:
+            return
+        self.app_state.upsert_video(item)
+
+    def upsert_videos(self, items: Sequence[VideoItem]) -> None:
+        if self._destroyed:
+            return
+        upsert_many = getattr(self.app_state, "upsert_videos", None)
+        if callable(upsert_many):
+            upsert_many(list(items or []))
+            return
+        for item in list(items or []):
+            self.app_state.upsert_video(item)
+
+    def remove_video(self, video_id: str) -> None:
+        if self._destroyed:
+            return
+        self._active_event_time_cache.pop(str(video_id), None)
+        self._cancel_metadata_retry(str(video_id))
+        self._clear_metadata_empty_failures(str(video_id))
+        self._drop_metadata_probe_queue_for(str(video_id))
+        self.app_state.remove_video(video_id)
+
+    def clear_videos(self) -> None:
+        if self._destroyed:
+            return
+        self._cancel_metadata_probe_queue()
+        self.app_state.clear_videos()
+
+    def invalidate_refresh_caches(self) -> None:
+        """同时失效静态、认证、日志与元数据缓存，并提升版本要求前端全量重同步。"""
+        if self._destroyed:
+            return
+        self._invalidate_file_log_cache()
+        self._static_snapshot_cache = None
+        self._platform_auth_cache.clear()
+        self._active_event_time_cache.clear()
+        self._cancel_all_metadata_retries()
+        self._cancel_metadata_probe_queue()
+        self._clear_metadata_empty_failures()
+        with self._delta_lock:
+            self._event_aggregator.reset()
+
+    def destroy(self) -> bool:
+        """Release resources; ``False`` means a process-exit guardian is draining."""
+
+        with self._destroy_lock:
+            return destroy_frontend_state_service(self)
+
+    @property
+    def frontend_version(self) -> int:
+        return self._event_aggregator.version
+
+    def frontend_metrics(self) -> dict[str, Any]:
+        self._wait_for_app_state_async_delivery()
+        metrics = self._event_aggregator.metrics()
+        with self._delta_lock:
+            metrics["pending_app_state_event_count"] = len(self._pending_app_state_events)
+            metrics["pending_app_state_event_overflowed"] = self._pending_app_state_events_overflowed
+        return metrics
+
+    def record_event(self, topic: str, payload: Mapping[str, Any] | None = None) -> None:
+        if self._destroyed:
+            return
+        with self._delta_lock:
+            normalized = str(topic or "")
+            payload_dict = dict(payload or {})
+            self._materialize_stage_title_for_event(normalized, payload_dict)
+            if normalized == "log":
+                message = str(payload_dict.get("message") or "")
+                if message:
+                    self.record_log(
+                        message,
+                        level=str(payload_dict.get("level") or "INFO"),
+                        source=str(payload_dict.get("source") or "Web"),
+                        trace_id=str(payload_dict.get("trace_id") or ""),
+                    )
+                return
+            sections = self._sections_for_recorded_event(normalized, payload_dict)
+            self._event_aggregator.record(normalized, payload_dict, sections=sections)
+
+    def _queue_app_state_change(self, payload: Any) -> None:
+        """先排队隔离事件线程；超限时丢最旧事件并标记全量重同步，形成有界背压。"""
+        if self._destroyed:
+            return
+        queued_payload = dict(payload) if isinstance(payload, dict) else payload
+        with self._delta_lock:
+            if len(self._pending_app_state_events) >= self.APP_STATE_PENDING_EVENTS_LIMIT:
+                self._pending_app_state_events.popleft()
+                self._pending_app_state_events_overflowed = True
+            self._pending_app_state_events.append(queued_payload)
+
+    def flush_pending_app_state_events(self) -> None:
+        """构建快照/增量前清空 AppState 队列；若曾溢出，先发布全量重同步标记。"""
+
+        self._wait_for_app_state_async_delivery()
+        with self._delta_lock:
+            if not self._pending_app_state_events and not self._pending_app_state_events_overflowed:
+                return
+            events = list(self._pending_app_state_events)
+            overflowed = self._pending_app_state_events_overflowed
+            self._pending_app_state_events.clear()
+            self._pending_app_state_events_overflowed = False
+
+            if overflowed:
+                self._event_aggregator.record(
+                    "app_state.resync_required",
+                    {"overflowed": True},
+                    sections=ALL_FRONTEND_SECTIONS,
+                )
+            for event_payload in events:
+                self._record_app_state_change(event_payload)
+
+    def _wait_for_app_state_async_delivery(self) -> None:
+        event_bus = getattr(self.app_state, "event_bus", None)
+        wait_for_async_idle = getattr(event_bus, "wait_for_async_idle", None)
+        if callable(wait_for_async_idle):
+            wait_for_async_idle(self.APP_STATE_ASYNC_DELIVERY_TIMEOUT_SECONDS)
+
+    def _record_app_state_change(self, payload: Any) -> None:
+        if self._destroyed:
+            return
+        if not isinstance(payload, dict):
+            self._event_aggregator.record("app_state.changed", {})
+            return
+        topic = str(payload.get("topic") or "app_state.changed")
+        self._materialize_stage_title_for_event(topic, payload)
+        sections = self._sections_for_recorded_event(topic, payload)
+        self._event_aggregator.record(topic, payload, sections=sections)
+
+    @staticmethod
+    def _sections_for_recorded_event(topic: str, payload: Mapping[str, Any]) -> frozenset[str] | None:
+        """根据事件内容选择最小刷新 section；状态跨桶时必须扩大到全部视频区。"""
+        normalized = str(topic or "")
+        if normalized == "logs.append" and payload.get("source") == "frontend_log_worker":
+            return frozenset({"log_items", "failed_items", "app_status"})
+        if normalized not in {"videos.update", "video_state_changed", "task_progress"}:
+            return sections_for_topic(normalized)
+        status = str(payload.get("status") or "")
+        parsed_status = parse_video_status(status)
+        try:
+            progress = int(payload.get("progress"))
+        except (TypeError, ValueError):
+            progress = None
+        terminal_text = any(marker in status for marker in ("\u5b8c\u6210", "\u5931\u8d25", "\u8d85\u65f6", "\u672c\u5730"))
+        if (
+            parsed_status in {VideoStatus.COMPLETED, VideoStatus.LOCAL, VideoStatus.FAILED, VideoStatus.TIMED_OUT}
+            or terminal_text
+            or progress == 100
+        ):
+            return VIDEO_SECTIONS
+        return sections_for_topic(normalized)
+
+    def _static_snapshot_parts(self) -> dict[str, Any]:
+        # 静态快照内嵌认证状态；TTL 到期必须整体失效，否则设置页会继续展示旧登录态。
+        if self._static_snapshot_cache is not None and self._platform_auth_cache_has_expired():
+            self._static_snapshot_cache = None
+        if self._static_snapshot_cache is None:
+            settings_snapshot = self.settings_snapshot()
+            settings_contract = self._settings_contract_payload(settings_snapshot)
+            self._static_snapshot_cache = {
+                "pages": list(PAGE_DEFINITIONS),
+                "settings_snapshot": settings_snapshot,
+                "settings_contract": settings_contract,
+                "icon_manifest": icon_manifest(),
+                "log_contract": log_contract(),
+            }
+        parts = dict(self._static_snapshot_cache)
+        parts["download_options"] = self.download_options_snapshot()
+        return parts
+
+    @staticmethod
+    def _settings_contract_payload(settings_snapshot: Mapping[str, Any]) -> dict[str, Any]:
+        order = [str(key) for key in settings_snapshot.keys()]
+        return {
+            "group_order": order,
+            "group_descriptions": {
+                group: GROUP_DESCRIPTIONS.get(group, "")
+                for group in order
+            },
+            "group_hints": {
+                group: GROUP_HINTS.get(group, "")
+                for group in order
+            },
+            "group_icons": {
+                group: GROUP_ICONS.get(group, "nav_settings.png")
+                for group in order
+            },
+        }
+
+    def _build_video_sections(
+        self,
+        *,
+        shallow: bool = False,
+        only: frozenset[str] | None = None,
+        log_items_cache: Sequence[Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        videos = self._videos(shallow=shallow)
+        queued_ids = self._queued_video_ids()
+        active_ids = self._active_video_ids()
+        queue_items: list[dict[str, Any]] = []
+        active_downloads: list[dict[str, Any]] = []
+        completed_items: list[dict[str, Any]] = []
+        failed_items: list[dict[str, Any]] = []
+        bucket_counts = {"queue": 0, "active": 0, "completed": 0, "failed": 0}
+        log_excerpt_index: dict[str, list[dict[str, Any]]] | None = None
+
+        want_failed = only is None or "failed_items" in only
+        want_completed = only is None or "completed_items" in only
+        want_active_items = only is None or "active_downloads" in only
+        want_active_for_status = only is not None and "app_status" in only
+        want_failed_for_status = only is None or "app_status" in only
+        failed_items_from_store = False
+        if want_failed:
+            log_excerpt_index = self._log_excerpt_index(log_items_cache=log_items_cache)
+
+        previous_probe_budget = self._metadata_probe_budget_remaining
+        if want_completed:
+            self._metadata_probe_budget_remaining = self.METADATA_PROBES_PER_SNAPSHOT
+        try:
+            for item in videos.values():
+                bucket = self._bucket_for_item(item, queued_ids=queued_ids, active_ids=active_ids)
+                item = self._ensure_stage_title_snapshot(item, bucket)
+                if bucket in bucket_counts:
+                    bucket_counts[bucket] += 1
+                if bucket == "active":
+                    if want_active_items or want_active_for_status:
+                        active_downloads.append(self._active_item(item))
+                elif bucket == "completed":
+                    if want_completed:
+                        completed_items.append(self._completed_item(item))
+                elif bucket == "failed":
+                    if want_failed:
+                        failed_items.append(self._failed_item(item, log_excerpt_index=log_excerpt_index))
+                else:
+                    if only is None or "queue_items" in only:
+                        queue_items.append(self._queue_item(item, queued_ids=queued_ids))
+        finally:
+            self._metadata_probe_budget_remaining = previous_probe_budget
+
+        if want_failed and not failed_items:
+            failed_items = self._failed_record_snapshot_items()
+            failed_items_from_store = bool(failed_items)
+        if want_failed_for_status and bucket_counts["failed"] == 0:
+            bucket_counts["failed"] = self._failed_record_snapshot_count(fallback_count=len(failed_items))
+
+        if want_failed and failed_items and not failed_items_from_store:
+            self._queue_failed_records(failed_items)
+        if want_failed and failed_items:
+            try:
+                display_language = str(self.config.get("appearance", "language", "zh-CN") or "zh-CN")
+            except (AttributeError, TypeError, ValueError):
+                display_language = "zh-CN"
+            failed_items = [
+                prepare_failed_item_for_display(item, language=display_language)
+                for item in failed_items
+            ]
+
+        sections: dict[str, Any] = {}
+        if only is None or "queue_items" in only:
+            sections["queue_items"] = queue_items
+        if only is None or "active_downloads" in only:
+            sections["active_downloads"] = active_downloads
+        if only is None or "completed_items" in only:
+            sections["completed_items"] = completed_items
+        if only is None or "failed_items" in only:
+            sections["failed_items"] = failed_items
+        if only is None or "app_status" in only:
+            include_active = only is None or "active_downloads" in only
+            sections["app_status"] = self.app_status(
+                queue_count=bucket_counts["queue"],
+                active_count=bucket_counts["active"],
+                completed_count=bucket_counts["completed"],
+                failed_count=bucket_counts["failed"],
+                active_downloads=active_downloads if (include_active or want_active_for_status) else None,
+            )
+        return sections
+
+    def get_snapshot(self, *, mock: bool = False, sections: frozenset[str] | None = None) -> dict[str, Any]:
+        """返回完整或局部快照；失败列表和日志列表需要共享同一份日志缓存。"""
+        self.flush_pending_app_state_events()
+        if mock:
+            snapshot = self.mock_snapshot()
+            snapshot["version"] = self.frontend_version
+            return snapshot
+
+        static_keys = frozenset({
+            "pages",
+            "icon_manifest",
+            "log_contract",
+            "settings_snapshot",
+            "settings_contract",
+            "download_options",
+        })
+        toolbox_keys = frozenset({
+            "toolbox_items",
+            "toolbox_recent_items",
+            "toolbox_display_projection",
+        })
+        video_keys = frozenset({"queue_items", "active_downloads", "completed_items", "failed_items", "app_status"})
+        if sections is None:
+            log_items_cache = self.log_items()
+            video_parts = self._build_video_sections(shallow=False, log_items_cache=log_items_cache)
+            result = dict(self._static_snapshot_parts())
+            result.update(self._toolbox_snapshot_parts())
+            result.update(video_parts)
+            result["log_items"] = log_items_cache
+            result["version"] = self.frontend_version
+            return result
+
+        result: dict[str, Any] = {}
+        log_items_cache: list[dict[str, Any]] | None = None
+        if "log_items" in sections and "failed_items" in sections:
+            log_items_cache = self.log_items()
+        if sections & static_keys:
+            result.update({key: value for key, value in self._static_snapshot_parts().items() if key in sections})
+        if sections & toolbox_keys:
+            result.update({key: value for key, value in self._toolbox_snapshot_parts().items() if key in sections})
+        if sections & video_keys:
+            shallow = sections <= (video_keys | frozenset({"log_items"}))
+            result.update(
+                self._build_video_sections(
+                    shallow=shallow,
+                    only=sections & video_keys,
+                    log_items_cache=log_items_cache,
+                )
+            )
+        if "log_items" in sections:
+            result["log_items"] = log_items_cache if log_items_cache is not None else self.log_items()
+        result["version"] = self.frontend_version
+        return result
+
+    def get_delta(
+        self,
+        since_version: int = 0,
+        *,
+        sections: frozenset[str] | set[str] | None = None,
+    ) -> dict[str, Any]:
+        """返回版本化增量；历史不足或版本异常时强制客户端做完整重同步。"""
+
+        self.flush_pending_app_state_events()
+        with self._delta_lock:
+            try:
+                base_version = int(since_version or 0)
+            except (TypeError, ValueError):
+                base_version = 0
+            dirty, history_sections, deleted_ids = self._event_aggregator.delta_since(base_version)
+            current_version = dirty.version
+            requested_sections = history_sections
+            if sections is not None:
+                requested_sections = history_sections | frozenset(sections)
+            full = base_version < 0 or base_version > current_version
+            if full:
+                requested_sections = frozenset(ALL_FRONTEND_SECTIONS)
+            elif base_version >= current_version:
+                requested_sections = frozenset()
+
+            snapshot_sections: dict[str, Any] = {}
+            if requested_sections:
+                partial = self.get_snapshot(sections=frozenset(requested_sections))
+                snapshot_sections = {
+                    key: value
+                    for key, value in partial.items()
+                    if key in requested_sections
+                }
+
+            return {
+                "version": current_version,
+                "base_version": base_version,
+                "full": full,
+                "changed_sections": sorted(requested_sections),
+                "sections": snapshot_sections,
+                "deleted_ids": [] if full else list(deleted_ids),
+                "events": list(dirty.pending_events)[-self.FRONTEND_DELTA_EVENTS_LIMIT:],
+                "priority": dirty.priority.name.lower(),
+                "metrics": self.frontend_metrics(),
+            }
+
+    def handle_action(self, action: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        if self._destroyed:
+            return FrontendActionResult("error", "frontend state service destroyed").to_dict()
+        execution_profile: ExecutionProfile | None = None
+        if action in self._TOOL_ACTIONS or action == "tool_admit_candidates":
+            execution_profile = self._capture_tool_execution_profile()
+            if not execution_profile.allow_tool_execution:
+                return dict(self._TOOL_RUN_DISABLED_RESULT)
+        if payload is not None and not isinstance(payload, Mapping):
+            return FrontendActionResult("error", "payload must be an object").to_dict()
+        payload = payload or {}
+        handler = {
+            "delete_item": self._action_delete_item,
+            "delete_failed_record": self._action_delete_failed_record,
+            "clear_failed_records": self._action_clear_failed_records,
+            "clear_queue": self._action_clear_queue,
+            "pause_download": self._action_pause_download,
+            "retry_failed": self._action_retry_failed,
+            "copy_diagnostics": self._action_copy_diagnostics,
+            "change_directory": self._action_change_directory,
+            "update_basic_setting": self._action_update_basic_setting,
+            "update_setting": self._action_update_setting,
+            "open_directory": self._action_open_directory,
+            "open_file": self._action_open_file,
+            "tool_validate": self._action_tool_validate,
+            "tool_start": self._action_tool_start,
+            "tool_cancel": self._action_tool_cancel,
+            "tool_open_result": self._action_tool_open_result,
+            "tool_admit_candidates": functools.partial(handle_frontend_link_candidate_admission, self),
+            "tool_clear_history": self._action_tool_clear_history,
+            "tool_reload": self._action_tool_reload,
+            "run_tool": self._action_run_tool,
+            "register_file_associations": self._action_register_file_associations,
+            "update_download_options": self._action_update_download_options,
+            "update_completed_metadata": self._action_update_completed_metadata,
+            "log_operation": self._action_log_operation,
+            "refresh_platform_auth_status": self._action_refresh_platform_auth_status,
+        }.get(action)
+        if handler is None:
+            return FrontendActionResult("error", f"unknown frontend action: {action}").to_dict()
+        if execution_profile is not None:
+            return handler(payload, execution_profile=execution_profile).to_dict()
+        return handler(payload).to_dict()
+
+    @staticmethod
+    def _strict_boolean(payload: Mapping[str, Any], key: str, *, default: bool) -> bool:
+        value = payload.get(key, default)
+        if not isinstance(value, bool):
+            raise ConfigValidationError(f"{key} must be a boolean")
+        return value
+
+    @classmethod
+    def _validate_boolean_fields(cls, payload: Mapping[str, Any], keys: Sequence[str]) -> None:
+        for key in keys:
+            if key in payload:
+                cls._strict_boolean(payload, key, default=False)
+
+    def queue_item_ids(self) -> set[str]:
+        queued_ids = self._queued_video_ids()
+        active_ids = self._active_video_ids()
+        with getattr(self.app_state, "_lock", threading.RLock()):
+            videos = dict(getattr(self.app_state, "videos", {}) or {})
+        if not videos:
+            controller_videos = getattr(self.controller, "videos", None)
+            if isinstance(controller_videos, dict):
+                videos = dict(controller_videos)
+        return {
+            item.id
+            for item in videos.values()
+            if getattr(item, "id", None) and self._bucket_for_item(item, queued_ids=queued_ids, active_ids=active_ids) == "queue"
+        }
+    def _videos(self, *, shallow: bool = False) -> dict[str, VideoItem]:
+        snapshot = getattr(self.controller, "_video_items_snapshot", None)
+        if callable(snapshot):
+            return snapshot()
+        videos = getattr(self.controller, "videos", None)
+        if isinstance(videos, dict):
+            return videos if shallow else deepcopy(videos)
+        snapshot_videos = getattr(self.app_state, "snapshot_videos", None)
+        if callable(snapshot_videos):
+            return snapshot_videos()
+        source = self.app_state.videos
+        return dict(source) if shallow else deepcopy(source)
+
+    def _video_for_update(self, video_id: str) -> VideoItem | None:
+        lookup = getattr(self.controller, "_video_lookup", None)
+        if callable(lookup):
+            return lookup(video_id)
+        videos = getattr(self.controller, "videos", None)
+        if isinstance(videos, dict):
+            return videos.get(video_id)
+        with getattr(self.app_state, "_lock", threading.RLock()):
+            return self.app_state.videos.get(video_id)
+
+    def _dl_manager(self) -> Any | None:
+        controller = self.controller
+        if controller is None:
+            return None
+        if hasattr(controller, "_dl_manager"):
+            manager = getattr(controller, "_dl_manager", None)
+            if manager is not None:
+                return manager
+            return None
+        return getattr(controller, "dl_manager", None)
+
+    def _config_section_values(self, section: str, defaults: Mapping[str, Any]) -> dict[str, Any]:
+        raw_data = getattr(self.config, "data", None)
+        section_data = raw_data.get(section, {}) if isinstance(raw_data, Mapping) else {}
+        return {
+            key: section_data.get(key, self.config.get(section, key, default))
+            for key, default in defaults.items()
+        }
+
+    def _apply_download_runtime_settings(self) -> None:
+        manager = self._dl_manager()
+        if manager is None:
+            return
+        download_cfg = self._config_section_values(
+            "download",
+            {
+                "max_concurrent": 3,
+                "max_retries": 3,
+                "request_timeout": 60,
+                "resume_enabled": True,
+                "speed_limit_kb": 0,
+                "video_only": False,
+                "image_respects_concurrency": False,
+                "image_fast_lane_limit": 10,
+            },
+        )
+        set_runtime_options = getattr(manager, "set_runtime_options", None)
+        if callable(set_runtime_options):
+            set_runtime_options(
+                max_concurrent=download_cfg.get("max_concurrent", 3),
+                max_retries=download_cfg.get("max_retries", 3),
+                request_timeout=download_cfg.get("request_timeout", 60),
+                resume_enabled=download_cfg.get("resume_enabled", True),
+                speed_limit_kb=download_cfg.get("speed_limit_kb", 0),
+                video_only=download_cfg.get("video_only", False),
+                image_respects_concurrency=download_cfg.get("image_respects_concurrency", False),
+                image_fast_lane_limit=download_cfg.get("image_fast_lane_limit", 10),
+            )
+            return
+
+    def _apply_logging_runtime_settings(self, *, cleanup_old_logs: bool = False) -> None:
+        logging_cfg = self._config_section_values(
+            "logging",
+            {
+                "level": "info",
+                "retention_days": 1,
+                "failed_record_retention_days": 7,
+                "cleanup_old_logs_on_start": False,
+                "ui_log_max_display_count": 300,
+                "auto_copy_trace_on_error": True,
+            },
+        )
+        configure = getattr(debug_logger, "configure", None)
+        if callable(configure):
+            configure(
+                level=logging_cfg.get("level", "info"),
+                retention_days=logging_cfg.get("retention_days", 1),
+                cleanup_old_logs=cleanup_old_logs,
+            )
+        configure_buffer = getattr(self.app_state, "configure_log_buffer", None)
+        if callable(configure_buffer):
+            configure_buffer(logging_cfg.get("ui_log_max_display_count", 300))
+        if cleanup_old_logs:
+            self._invalidate_file_log_cache(limit=logging_cfg.get("ui_log_max_display_count", 300))
+        else:
+            self._resize_file_log_cache_limit(logging_cfg.get("ui_log_max_display_count", 300))
+        set_auto_copy = getattr(self.app_state, "set_auto_copy_trace_on_error", None)
+        if callable(set_auto_copy):
+            set_auto_copy(bool(logging_cfg.get("auto_copy_trace_on_error", True)))
+        request_prune = getattr(self.failed_record_store, "request_prune", None)
+        if callable(request_prune):
+            try:
+                request_prune(int(logging_cfg.get("failed_record_retention_days", 7) or 7))
+            except Exception as exc:
+                debug_logger.log_exception(
+                    "FrontendStateService",
+                    "failed_record_store.request_prune",
+                    exc,
+                    details={"retention_days": logging_cfg.get("failed_record_retention_days", 7)},
+                )
+
+    def _apply_runtime_setting(self, section: str, key: str, value: Any) -> None:
+        """配置保存后同步运行时对象；涉及 Qt 控件的更新必须转回 GUI 线程。"""
+        if section == "download":
+            self._apply_download_runtime_settings()
+        elif section == "logging":
+            self._apply_logging_runtime_settings(cleanup_old_logs=key == "retention_days")
+        elif section == "common":
+            self._dispatch_gui_runtime_setting("_apply_common_setting", key, value)
+        elif section == "appearance":
+            self._dispatch_gui_runtime_setting("_apply_appearance_runtime_settings", key)
+        elif section == "playback":
+            self._dispatch_gui_runtime_setting("_apply_playback_runtime_settings")
+        elif key in {"max_items", "max_pages", "search_max_pages"}:
+            self._dispatch_gui_runtime_setting("_apply_platform_runtime_setting", section, key, value)
+
+    @contextmanager
+    def _capture_config_runtime_failures(
+        self,
+    ) -> Iterator[list[tuple[str, str, Exception]]]:
+        """在线程局部栈中收集同步配置观察器异常，使当前动作能报告持久化后应用失败。"""
+        captures = getattr(self._config_runtime_capture_local, "captures", None)
+        if captures is None:
+            captures = []
+            self._config_runtime_capture_local.captures = captures
+        failures: list[tuple[str, str, Exception]] = []
+        captures.append(failures)
+        try:
+            yield failures
+        finally:
+            captures.pop()
+            if not captures:
+                del self._config_runtime_capture_local.captures
+
+    def _record_config_runtime_failure(self, section: str, key: str, exc: Exception) -> None:
+        captures = getattr(self._config_runtime_capture_local, "captures", None)
+        if captures:
+            captures[-1].append((str(section), str(key), exc))
+
+    @staticmethod
+    def _runtime_failure_message(prefix: str, failures: Sequence[tuple[str, str, Exception]]) -> str:
+        section, key, exc = failures[0]
+        suffix = f" ({section}.{key})" if section and key else ""
+        return f"{prefix} persisted but runtime apply failed{suffix}: {exc}"
+
+    @safe_slot
+    def _on_config_changed(self, payload: Any) -> None:
+        if not isinstance(payload, Mapping):
+            return
+        raw_changes = payload.get("changes")
+        candidates = raw_changes if isinstance(raw_changes, (list, tuple)) else (payload,)
+        changes = [
+            {
+                "section": str(change.get("section") or ""),
+                "key": str(change.get("key") or ""),
+                "value": change.get("value"),
+            }
+            for change in candidates
+            if isinstance(change, Mapping) and change.get("section") and change.get("key")
+        ]
+        if not changes:
+            return
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for change in changes:
+            grouped.setdefault(change["section"], []).append(change)
+        for section, section_changes in grouped.items():
+            runtime_changes = section_changes
+            if section in {"download", "playback"}:
+                runtime_changes = [section_changes[-1]]
+            elif section == "logging":
+                retention_change = next(
+                    (change for change in section_changes if change["key"] == "retention_days"),
+                    None,
+                )
+                runtime_changes = [retention_change or section_changes[-1]]
+            for change in runtime_changes:
+                try:
+                    self._apply_runtime_setting(section, change["key"], change["value"])
+                except Exception as exc:
+                    self._record_config_runtime_failure(section, change["key"], exc)
+                    debug_logger.log_exception(
+                        "FrontendStateService",
+                        "config_changed_runtime_apply",
+                        exc,
+                        details={"section": section, "key": change["key"]},
+                    )
+
+        if any(self._platform_auth_config_affects_status(change["section"], change["key"]) for change in changes):
+            self._invalidate_platform_auth_cache()
+        else:
+            self._static_snapshot_cache = None
+        event_payload = {"section": changes[-1]["section"], "key": changes[-1]["key"]}
+        if len(changes) > 1:
+            event_payload["changes"] = [
+                {"section": change["section"], "key": change["key"]}
+                for change in changes
+            ]
+        # WebController 注入的 emitter 由 WebSocketBridge 驱动；仅记录脏 section
+        # 只会提升服务端版本，无法唤醒因外部进程改配置而等待中的浏览器。
+        if callable(self._frontend_event_emitter):
+            self._emit_frontend_event("settings.update", event_payload)
+        else:
+            self.record_event("settings.update", event_payload)
+        if payload.get("external"):
+            self._dispatch_gui_runtime_setting("_on_external_config_changed", event_payload)
+
+    def _dispatch_gui_runtime_setting(self, method_name: str, *args: Any) -> bool:
+        """把窗口运行时设置派发到 GUI 线程，避免后台配置回调直接触碰 Qt 对象。"""
+        controller = self.controller
+        window = getattr(controller, "window", None)
+        target = window or controller
+        method = getattr(target, method_name, None)
+        if not callable(method):
+            return False
+
+        def _call() -> None:
+            method(*args)
+
+        if self._is_qt_gui_thread():
+            _call()
+        elif (
+            self._gui_runtime_invoker is not None
+            and self._gui_runtime_adapter.owns_qobject(getattr(method, "__self__", target))
+        ):
+            self._gui_runtime_invoker.invoke_and_wait(
+                _call,
+                timeout_seconds=self.GUI_RUNTIME_APPLY_TIMEOUT_SECONDS,
+            )
+        elif callable(getattr(target, "invoke_on_ui_thread", None)):
+            completion = target.invoke_on_ui_thread(_call)
+            wait_for_result = getattr(completion, "result", None)
+            if not callable(wait_for_result):
+                raise RuntimeError("GUI runtime dispatcher did not provide a completion acknowledgement")
+            wait_for_result(timeout=self.GUI_RUNTIME_APPLY_TIMEOUT_SECONDS)
+        else:
+            _call()
+        return True
+
+    def _queued_video_ids(self) -> set[str]:
+        manager = self._dl_manager()
+        queued_video_ids = getattr(manager, "queued_video_ids", None)
+        if callable(queued_video_ids):
+            return queued_video_ids()
+        queue_obj = getattr(manager, "queue", None)
+        if queue_obj is None:
+            return set()
+        snapshot_video_ids = getattr(queue_obj, "snapshot_video_ids", None)
+        if callable(snapshot_video_ids):
+            return snapshot_video_ids()
+        return set()
+
+    def _active_video_ids(self) -> set[str]:
+        manager = self._dl_manager()
+        prune_finished = getattr(manager, "prune_finished_workers", None)
+        if callable(prune_finished):
+            prune_finished()
+        lock = getattr(manager, "_workers_lock", None)
+        if lock is not None:
+            with lock:
+                workers = list(getattr(manager, "workers", []) or [])
+        else:
+            workers = list(getattr(manager, "workers", []) or [])
+        ids: set[str] = set()
+        for worker in workers:
+            video = getattr(worker, "video", None)
+            video_id = getattr(video, "id", "")
+            if video_id:
+                ids.add(video_id)
+        return ids
+
+    def _bucket_for_item(self, item: VideoItem, *, queued_ids: set[str], active_ids: set[str]) -> str:
+        return video_adapter.bucket_for_item(item, queued_ids=queued_ids, active_ids=active_ids)
+
+    def _materialize_stage_title_for_event(self, topic: str, payload: Mapping[str, Any]) -> None:
+        """事件到达时固化当前阶段标题，避免列表迁移后标题被其他阶段规则改写。"""
+        if str(topic or "") not in {
+            "item_found",
+            "scan_result",
+            "task_started",
+            "task_finished",
+            "task_error",
+            "videos.upsert",
+            "videos.upsert_many",
+            "videos.update",
+            "video_state_changed",
+            "task_progress",
+        }:
+            return
+        video_ids = self._event_video_ids(payload)
+        if not video_ids:
+            return
+        queued_ids = self._queued_video_ids()
+        active_ids = self._active_video_ids()
+        for video_id in video_ids:
+            item = self._video_for_update(video_id)
+            if item is None:
+                continue
+            bucket = self._bucket_for_item(item, queued_ids=queued_ids, active_ids=active_ids)
+            self._ensure_stage_title_snapshot(item, bucket)
+
+    @staticmethod
+    def _event_video_ids(payload: Mapping[str, Any]) -> list[str]:
+        ids: list[str] = []
+        for key in ("video_id", "id", "entity_id"):
+            value = payload.get(key)
+            if value:
+                ids.append(str(value))
+        raw_ids = payload.get("video_ids")
+        if isinstance(raw_ids, (list, tuple, set)):
+            ids.extend(str(value) for value in raw_ids if value)
+        elif raw_ids:
+            ids.append(str(raw_ids))
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for video_id in ids:
+            if video_id in seen:
+                continue
+            seen.add(video_id)
+            ordered.append(video_id)
+        return ordered
+
+    def _ensure_stage_title_snapshot(self, item: VideoItem, bucket: str) -> VideoItem:
+        stage_key = video_adapter.STAGE_TITLE_KEYS.get(bucket)
+        if not stage_key:
+            return item
+        target = self._video_for_update(str(getattr(item, "id", "") or "")) or item
+        if not isinstance(getattr(target, "meta", None), dict):
+            target.meta = {}
+        meta = target.meta
+        previous_stage = str(meta.get(UI_TITLE_STAGE_META_KEY) or "")
+        current_title = str(meta.get(stage_key) or "").strip()
+        if previous_stage != bucket or not current_title:
+            meta[stage_key] = self._build_stage_display_title(target)
+            meta[UI_TITLE_STAGE_META_KEY] = bucket
+            meta[UI_TITLE_TEMPLATE_META_KEY] = self._current_filename_template()
+        if target is not item:
+            if not isinstance(getattr(item, "meta", None), dict):
+                item.meta = {}
+            for key in (stage_key, UI_TITLE_STAGE_META_KEY, UI_TITLE_TEMPLATE_META_KEY):
+                if key in meta:
+                    item.meta[key] = meta[key]
+        return item
+
+    def _build_stage_display_title(self, item: VideoItem) -> str:
+        filename = self._render_filename_for_current_template(item)
+        return video_adapter.filename_stem(filename) or str(getattr(item, "title", "") or "")
+
+    def _render_filename_for_current_template(self, item: VideoItem) -> str:
+        meta = item.meta if isinstance(getattr(item, "meta", None), dict) else {}
+        ext = self._stage_filename_extension(item)
+        preferred_name = meta.get("preferred_filename") or meta.get("file_name")
+        current_name = str(preferred_name or getattr(item, "title", "") or "").strip()
+        template = self._current_filename_template()
+        raw_name = current_name
+        if template and template != CURRENT_FILENAME_TEMPLATE:
+            now = datetime.now()
+            context = {
+                "title": current_name,
+                "platform": str(getattr(item, "source", "") or ""),
+                "source": str(getattr(item, "source", "") or ""),
+                "id": str(getattr(item, "id", "") or ""),
+                "date": now.strftime("%Y%m%d"),
+                "datetime": now.strftime("%Y%m%d_%H%M%S"),
+                "index": str(
+                    meta.get("index")
+                    or meta.get("sequence")
+                    or meta.get("part_index")
+                    or ""
+                ),
+            }
+
+            class _Missing(dict):
+                def __missing__(self, key):
+                    return ""
+
+            try:
+                raw_name = template.format_map(_Missing(context)).strip() or current_name
+            except (KeyError, ValueError, IndexError):
+                raw_name = current_name
+        desc = sanitize_filename(raw_name)
+        base_name, current_ext = os.path.splitext(desc)
+        safe_name = base_name if current_ext.lower() == ext.lower() else desc
+        safe_name = safe_name[:200] or f"{getattr(item, 'source', '')}_{getattr(item, 'id', '')}"
+        return f"{safe_name}{ext}"
+
+    def _current_filename_template(self) -> str:
+        try:
+            template = self.config.get("common", "filename_template", CURRENT_FILENAME_TEMPLATE)
+        except Exception:
+            template = CURRENT_FILENAME_TEMPLATE
+        return str(template or CURRENT_FILENAME_TEMPLATE).strip() or CURRENT_FILENAME_TEMPLATE
+
+    @staticmethod
+    def _stage_filename_extension(item: VideoItem) -> str:
+        meta = item.meta if isinstance(getattr(item, "meta", None), dict) else {}
+        for value in (
+            getattr(item, "local_path", ""),
+            meta.get("output_filename"),
+            meta.get("filename"),
+            meta.get("preferred_filename"),
+            meta.get("file_name"),
+        ):
+            _base, ext = os.path.splitext(str(value or "").strip())
+            if ext:
+                return ext
+        return ".mp4"
+
+    def _platform_label(self, item: VideoItem) -> str:
+        plugin = registry.get_plugin(item.source)
+        return plugin.name if plugin else (item.source or "本地")
+
+    @staticmethod
+    def _trace_id(item: VideoItem) -> str:
+        return video_adapter.trace_id(item)
+
+    def _queue_status(self, item: VideoItem, queued_ids: set[str]) -> str:
+        return video_adapter.queue_status(item, queued_ids)
+
+    def _queue_item(self, item: VideoItem, *, queued_ids: set[str]) -> dict[str, Any]:
+        return video_adapter.queue_item(item, queued_ids=queued_ids, platform_label=self._platform_label)
+
+    @staticmethod
+    def _queue_subtitle(meta: dict) -> str:
+        return video_adapter.queue_subtitle(meta)
+
+    def _active_item(self, item: VideoItem) -> dict[str, Any]:
+        return video_adapter.active_item(
+            item,
+            platform_label=self._platform_label,
+            current_save_dir=self._current_save_dir(),
+            active_events=self._active_events,
+        )
+
+    def _completed_item(self, item: VideoItem) -> dict[str, Any]:
+        path = Path(item.local_path) if item.local_path else None
+        meta = item.meta or {}
+        size_bytes = int(meta.get("size_bytes", 0) or 0)
+        stat = self._safe_stat(path) if path is not None else None
+        if size_bytes <= 0 and path is not None:
+            size_bytes = stat.st_size if stat else 0
+        completed_at = str(meta.get("completed_at") or meta.get("mtime") or self._format_mtime(stat))
+        metadata, metadata_pending = self._completed_media_metadata(item, path)
+        return video_adapter.completed_item(
+            item,
+            path=path,
+            size_bytes=size_bytes,
+            completed_at=completed_at,
+            metadata=metadata,
+            metadata_pending=metadata_pending,
+            platform_label=self._platform_label,
+        )
+
+    def _completed_media_metadata(self, item: VideoItem, path: Path | None) -> tuple[MediaMetadata, bool]:
+        if self._destroyed:
+            return MediaMetadata(), False
+        meta = item.meta or {}
+        if self._has_media_metadata(meta, path):
+            return MediaMetadata(), False
+        if path is None or not path.exists():
+            return MediaMetadata(), False
+        failure_key = self._metadata_failure_key(item.id, str(path))
+        if self._metadata_empty_retries_exhausted(failure_key):
+            return MediaMetadata(), False
+        cached = self.media_metadata_service.cached(path)
+        if cached is not None:
+            self._clear_metadata_empty_failures(item.id, str(path))
+            return cached, False
+        deferred = getattr(self.media_metadata_service, "is_probe_deferred", None)
+        if callable(deferred) and deferred(path):
+            return MediaMetadata(), True
+        if not self._consume_metadata_probe_budget():
+            self._queue_completed_metadata_probe(item.id, str(path))
+            return MediaMetadata(), True
+
+        def on_metadata_ready(metadata: MediaMetadata, *, video_id: str = item.id, source_path: str = str(path)) -> None:
+            if self._destroyed:
+                return
+            target = self._video_for_update(video_id)
+            if target is None:
+                debug_logger.log(
+                    component="FrontendStateService",
+                    action="metadata_probe_discarded",
+                    level="WARN",
+                    message="Completed media metadata probe result was discarded because the item no longer exists",
+                    details={"video_id": video_id, "source_path": source_path},
+                )
+                return
+            if not self._same_local_path(str(getattr(target, "local_path", "") or ""), source_path):
+                debug_logger.log(
+                    component="FrontendStateService",
+                    action="metadata_probe_discarded",
+                    level="WARN",
+                    message="Completed media metadata probe result was discarded because the local path changed",
+                    details={
+                        "video_id": video_id,
+                        "source_path": source_path,
+                        "current_path": str(getattr(target, "local_path", "") or ""),
+                    },
+                )
+                return
+            metadata_payload = {
+                "duration": metadata.duration,
+                "resolution": metadata.resolution,
+                "format": metadata.format,
+                "content_type": metadata.content_type,
+            }
+            has_useful_metadata = bool(metadata.duration or metadata.resolution)
+            self._apply_completed_metadata(target, metadata_payload)
+            if has_useful_metadata:
+                self._clear_metadata_empty_failures(video_id, source_path)
+                self._cancel_metadata_retry(video_id)
+            else:
+                attempts = self._record_metadata_empty_failure(video_id, source_path)
+                if not self._metadata_empty_retries_exhausted(self._metadata_failure_key(video_id, source_path)):
+                    self._schedule_metadata_retry(video_id, source_path)
+            if not has_useful_metadata:
+                debug_logger.log(
+                    component="FrontendStateService",
+                    action="metadata_probe_empty",
+                    level="WARN",
+                    message="Completed media metadata probe finished without usable duration or resolution",
+                    details={
+                        "video_id": video_id,
+                        "source_path": source_path,
+                        "attempts": attempts,
+                        "max_retries": self.METADATA_EMPTY_MAX_RETRIES,
+                    },
+                )
+            self._emit_frontend_event(
+                "videos.metadata",
+                {
+                    "video_id": video_id,
+                    "metadata": has_useful_metadata,
+                    **({"exhausted": True} if not has_useful_metadata and attempts >= self.METADATA_EMPTY_MAX_RETRIES else {}),
+                },
+            )
+
+        pending = self.media_metadata_service.ensure_probe(path, on_metadata_ready)
+        if not pending:
+            pending = bool(deferred(path)) if callable(deferred) else False
+        if self._metadata_empty_retries_exhausted(failure_key):
+            pending = False
+        return MediaMetadata(), pending
+
+    def _consume_metadata_probe_budget(self) -> bool:
+        budget = self._metadata_probe_budget_remaining
+        if budget is None:
+            return True
+        if budget <= 0:
+            return False
+        self._metadata_probe_budget_remaining = budget - 1
+        return True
+
+    def _queue_completed_metadata_probe(self, video_id: str, source_path: str) -> None:
+        if self._destroyed:
+            return
+        self._metadata_probe_scheduler.queue(video_id, source_path)
+
+    def _drain_queued_metadata_probes(self, generation: int | None = None) -> None:
+        self._metadata_probe_scheduler.drain(generation)
+
+    def _drop_metadata_probe_queue_for(self, video_id: str) -> None:
+        self._metadata_probe_scheduler.drop_for(video_id)
+
+    def _cancel_metadata_probe_queue(self, *, close: bool = False) -> None:
+        self._metadata_probe_scheduler.cancel(close=close)
+
+    @property
+    def _metadata_probe_queue(self) -> dict[str, tuple[str, str]]:
+        return self._metadata_probe_scheduler.pending
+
+    @property
+    def _metadata_probe_queue_timer(self) -> Any | None:
+        return self._metadata_probe_scheduler.timer
+
+    @property
+    def _metadata_probe_queue_closed(self) -> bool:
+        return self._metadata_probe_scheduler.closed
+
+    def update_completed_metadata(
+        self,
+        video_id: str,
+        metadata: Mapping[str, Any] | None,
+        *,
+        source: str = "",
+    ) -> dict[str, Any]:
+        if self._destroyed:
+            return FrontendActionResult("error", "frontend state service destroyed").to_dict()
+        video_id = str(video_id or "")
+        if not video_id:
+            return FrontendActionResult("error", "missing video id").to_dict()
+        item = self._video_for_update(video_id)
+        if item is None:
+            return FrontendActionResult("error", "completed item not found", {"video_id": video_id}).to_dict()
+        normalized = self._normalize_completed_metadata_payload(metadata or {})
+        if not any(normalized.values()):
+            return FrontendActionResult("ok", "metadata ignored", {"video_id": video_id, "changed": False}).to_dict()
+        changed = self._apply_completed_metadata(item, normalized)
+        if changed:
+            self._emit_frontend_event(
+                "videos.metadata",
+                {"video_id": video_id, "metadata": True, "source": source or "frontend"},
+            )
+        return FrontendActionResult(
+            "ok",
+            "metadata updated" if changed else "metadata unchanged",
+            {"video_id": video_id, "changed": changed},
+        ).to_dict()
+
+    def _action_update_completed_metadata(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        video_id = str(payload.get("id") or payload.get("video_id") or "")
+        metadata = dict(payload.get("metadata") or {})
+        for key in ("duration", "resolution", "format", "content_type", "duration_ms", "width", "height"):
+            if key in payload and key not in metadata:
+                metadata[key] = payload[key]
+        result = self.update_completed_metadata(video_id, metadata, source=str(payload.get("source") or "web_player"))
+        return FrontendActionResult(
+            str(result.get("status") or "error"),
+            str(result.get("message") or ""),
+            dict(result.get("data") or {}),
+        )
+
+    def refresh_platform_auth_status(self, *, force: bool = False) -> bool:
+        if self._destroyed:
+            return False
+        should_refresh = bool(force) or self._static_snapshot_cache is None or self._platform_auth_cache_has_expired()
+        if not should_refresh:
+            return False
+        self._platform_auth_force_refresh_once = bool(force)
+        self._static_snapshot_cache = None
+        self.record_event("settings.platform_auth", {"force": bool(force), "refreshed": True})
+        return True
+
+    def _action_refresh_platform_auth_status(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        try:
+            force = self._strict_boolean(payload, "force", default=False)
+        except ConfigValidationError as exc:
+            return FrontendActionResult("error", str(exc))
+        refreshed = self.refresh_platform_auth_status(force=force)
+        return FrontendActionResult(
+            "ok",
+            "平台认证状态已刷新" if refreshed else "",
+            {"refreshed": refreshed},
+        )
+    def _action_log_operation(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        operation = str(payload.get("operation") or payload.get("id") or "").strip()
+        try:
+            if operation == "refresh":
+                self.invalidate_refresh_caches()
+                return FrontendActionResult("ok", "日志缓存已刷新")
+            if operation == "clear":
+                self.app_state.clear_logs()
+                self._truncate_latest_debug_log()
+                self.invalidate_refresh_caches()
+                self.record_event("logs.append", {"operation": operation, "cleared": True})
+                return FrontendActionResult("ok", "日志已清空")
+            if operation == "export":
+                export_path = self._export_latest_debug_log()
+                return FrontendActionResult("ok", "日志已导出", {"path": str(export_path)})
+            if operation == "open_latest":
+                path = Path(debug_logger.latest_file)
+                self._open_file_path(path)
+                return FrontendActionResult("ok", "已打开 latest_debug.log", {"path": str(path)})
+            if operation == "open_error_summary":
+                path = Path(debug_logger.latest_error_summary_file)
+                self._open_file_path(path)
+                return FrontendActionResult("ok", "已打开 latest_error_summary.md", {"path": str(path)})
+            return FrontendActionResult("error", f"unknown log operation: {operation}")
+        except Exception as exc:
+            return FrontendActionResult("error", f"日志操作失败: {exc}", {"operation": operation})
+
+    @staticmethod
+    def _truncate_latest_debug_log() -> None:
+        file_actions.truncate_latest_debug_log()
+
+    @staticmethod
+    def _export_latest_debug_log() -> Path:
+        return file_actions.export_latest_debug_log()
+
+    @staticmethod
+    def _open_file_path(path: Path) -> None:
+        file_actions.open_file_path(path)
+
+    def _normalize_completed_metadata_payload(self, metadata: Mapping[str, Any]) -> dict[str, str]:
+        return metadata_rules.normalize_completed_metadata_payload(metadata)
+
+    def _apply_completed_metadata(self, item: VideoItem, metadata: Mapping[str, Any]) -> bool:
+        if item.meta is None:
+            item.meta = {}
+        return metadata_rules.apply_completed_metadata(item.meta, metadata)
+
+    def _emit_frontend_event(self, topic: str, payload: dict[str, Any]) -> None:
+        if self._destroyed:
+            return
+        emitter = self._frontend_event_emitter
+        emitted = False
+        if callable(emitter):
+            emitter(topic, payload)
+            emitted = True
+        if emitted and self._owns_app_state:
+            return
+        publisher = getattr(self.app_state, "_publish_change", None)
+        if callable(publisher):
+            publisher(topic, payload)
+            return
+        if not emitted or not self._owns_app_state:
+            self.record_event(topic, payload)
+
+    def _schedule_metadata_retry(self, video_id: str, source_path: str) -> None:
+        if self._destroyed:
+            return
+        self._metadata_retry_tracker.schedule(video_id, source_path)
+
+    def _cancel_metadata_retry(self, video_id: str) -> None:
+        self._metadata_retry_tracker.cancel(video_id)
+
+    def _cancel_all_metadata_retries(self) -> None:
+        self._metadata_retry_tracker.cancel_all()
+
+    def _retry_completed_metadata_probe(self, video_id: str, source_path: str) -> bool:
+        """重试完成文件元数据探测；文件路径已变化时放弃旧重试。"""
+        if self._destroyed:
+            return False
+        target = self._video_for_update(video_id)
+        if target is None:
+            return False
+        current_path = str(getattr(target, "local_path", "") or "")
+        if not self._same_local_path(current_path, source_path):
+            return False
+        path = Path(source_path)
+        if not path.exists():
+            return False
+        _metadata, pending = self._completed_media_metadata(target, path)
+        return bool(pending)
+
+    def _metadata_failure_key(self, video_id: str, source_path: str) -> str:
+        return metadata_rules.metadata_failure_key(video_id, source_path)
+
+    def _record_metadata_empty_failure(self, video_id: str, source_path: str) -> int:
+        return self._metadata_retry_tracker.record_empty_failure(video_id, source_path)
+
+    def _metadata_empty_retries_exhausted(self, failure_key: str) -> bool:
+        return self._metadata_retry_tracker.exhausted(failure_key)
+
+    def _clear_metadata_empty_failures(self, video_id: str | None = None, source_path: str | None = None) -> None:
+        self._metadata_retry_tracker.clear_failures(video_id, source_path)
+
+    @classmethod
+    def _has_media_metadata(cls, meta: Mapping[str, Any], path: Path | None = None) -> bool:
+        return metadata_rules.has_media_metadata(meta, path)
+
+    @staticmethod
+    def _has_display_duration(value: Any) -> bool:
+        return metadata_rules.has_display_duration(value)
+
+    @classmethod
+    def _display_resolution(cls, *values: Any) -> str:
+        return video_adapter.display_resolution(*values)
+
+    @staticmethod
+    def _is_real_resolution(value: Any) -> bool:
+        return video_adapter.is_real_resolution(value)
+
+    @classmethod
+    def _same_local_path(cls, left: str, right: str) -> bool:
+        return metadata_rules.same_local_path(left, right)
+
+    @staticmethod
+    def _normalize_local_path(value: str) -> str:
+        return metadata_rules.normalize_local_path(value)
+
+    @staticmethod
+    def _display_duration(value: Any) -> str:
+        return video_adapter.display_duration(value)
+
+    @staticmethod
+    def _format_completed_at_table(value: str) -> str:
+        return video_adapter.format_completed_at_table(value)
+
+    def _failed_item(
+        self,
+        item: VideoItem,
+        *,
+        log_excerpt_index: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> dict[str, Any]:
+        item_trace_id = self._trace_id(item)
+        log_excerpt_items = self._failed_log_excerpt_items(item, item_trace_id, log_excerpt_index)
+        return video_adapter.failed_item(
+            item,
+            platform_label=self._platform_label,
+            log_excerpt_items=log_excerpt_items,
+            failed_at_fallback=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+    def _failed_record_snapshot_items(self) -> list[dict[str, Any]]:
+        """读取失败记录存储的快照，作为内存视频项之外的持久失败列表来源。"""
+        records_snapshot = getattr(self.failed_record_store, "records_snapshot", None)
+        if not callable(records_snapshot):
+            return []
+        try:
+            rows = records_snapshot(limit=self.FAILED_RECORD_SNAPSHOT_LIMIT)
+        except TypeError:
+            try:
+                rows = records_snapshot()
+            except Exception as exc:
+                debug_logger.log_exception(
+                    "FrontendStateService",
+                    "failed_record_store.records_snapshot",
+                    exc,
+                )
+                return []
+        except Exception as exc:
+            debug_logger.log_exception(
+                "FrontendStateService",
+                "failed_record_store.records_snapshot",
+                exc,
+            )
+            return []
+        if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+            return []
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            item = dict(row)
+            if not item.get("id") and item.get("video_id"):
+                item["id"] = str(item.get("video_id") or "")
+            if item.get("id"):
+                items.append(item)
+        return items
+
+    def _failed_record_snapshot_count(self, *, fallback_count: int = 0) -> int:
+        try:
+            total_count = int(getattr(self.failed_record_store, "snapshot_total_count", fallback_count) or 0)
+        except Exception as exc:
+            debug_logger.log_exception(
+                "FrontendStateService",
+                "failed_record_store.snapshot_total_count",
+                exc,
+            )
+            total_count = int(fallback_count or 0)
+        return max(int(fallback_count or 0), total_count)
+
+    @staticmethod
+    def _safe_stat(path: Path | None):
+        if not path:
+            return None
+        try:
+            return path.stat()
+        except OSError:
+            return None
+
+    @staticmethod
+    def _format_mtime(stat) -> str:
+        if not stat:
+            return "--"
+        return datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 这些转换没有服务层状态，直接复用 adapter，避免两边逐渐产生不同规则。
+    _format_size = staticmethod(video_adapter.format_size)
+    _format_from_path = staticmethod(video_adapter.format_from_path)
+    _content_type_from_path = staticmethod(video_adapter.content_type_from_path)
+    _default_speed_trend = staticmethod(video_adapter.default_speed_trend)
+
+    def _active_events(
+        self,
+        item: VideoItem,
+        *,
+        progress: int,
+        chunks_done: int,
+        chunks_total: int,
+        speed: str,
+        remaining_time: str,
+        write_status: str,
+        merge_status: str,
+        trace_id: str,
+    ) -> list[dict[str, str]]:
+        return video_adapter.active_events(
+            item,
+            progress=progress,
+            chunks_done=chunks_done,
+            chunks_total=chunks_total,
+            speed=speed,
+            remaining_time=remaining_time,
+            write_status=write_status,
+            merge_status=merge_status,
+            trace_id=trace_id,
+            event_time_cache=self._active_event_time_cache,
+        )
+
+    def _stable_active_event_time(self, item: VideoItem, existing: list[dict[str, str]]) -> str:
+        return video_adapter.stable_active_event_time(
+            item,
+            existing,
+            event_time_cache=self._active_event_time_cache,
+        )
+
+    @staticmethod
+    def _format_event_clock(value: Any) -> str:
+        return video_adapter.format_event_clock(value)
+
+    @staticmethod
+    def _default_active_events(item: VideoItem) -> list[dict[str, str]]:
+        return video_adapter.default_active_events(item)
+
+    def _solutions_for_reason(self, reason: str) -> list[dict[str, str]]:
+        return video_adapter.solutions_for_reason(reason)
+
+    @staticmethod
+    def _failure_category(reason: str) -> dict[str, str]:
+        return video_adapter.failure_category(reason)
+
+    @classmethod
+    def _format_failed_at_table(cls, value: str) -> str:
+        return cls._format_completed_at_table(value)
+
+    def log_items(self) -> list[dict[str, Any]]:
+        """合并 UI 环形日志和文件日志尾部，并补齐前端展示字段。"""
+        buffer = self.app_state.get_log_buffer()
+        merged = self._file_log_cache_store.merged_items(buffer)
+        return [self._enrich_log_item(item) for item in merged]
+
+    def _ui_log_display_limit(self) -> int:
+        config = getattr(self, "config", None)
+        raw_value = config.get("logging", "ui_log_max_display_count", 300) if config is not None else 300
+        return FrontendLogCache.normalize_limit(raw_value)
+
+    @staticmethod
+    def _file_log_cache_key(limit: int) -> str:
+        return FrontendLogCache.cache_key(limit)
+
+    @staticmethod
+    def _latest_debug_log_path() -> Path:
+        try:
+            from app.debug_logger import debug_logger
+
+            return Path(debug_logger.latest_file)
+        except Exception:
+            return Path("__missing_latest_debug_log__")
+
+    def _on_file_log_cache_refreshed(self, count: int) -> None:
+        self.record_event(
+            "logs.append",
+            {"count": int(count), "source": "frontend_log_worker", "batched": True},
+        )
+
+    def refresh_file_log_cache(self, *, timeout: float | None = None) -> list[dict[str, Any]]:
+        """供测试和维护任务同步刷新解析后的文件日志；正常快照路径使用后台 worker。"""
+        items = self._file_log_cache_store.refresh_now(self._ui_log_display_limit())
+        if timeout is not None:
+            self._file_log_cache_store.wait_for_idle(timeout)
+        return items
+
+    def _invalidate_file_log_cache(self, *, limit: Any | None = None) -> None:
+        self._file_log_cache_store.invalidate(limit=limit)
+
+    def _resize_file_log_cache_limit(self, limit: Any) -> None:
+        self._file_log_cache_store.resize_limit(limit)
+
+    def _enrich_log_item(self, item: Mapping[str, Any]) -> dict[str, Any]:
+        return log_adapter.enrich_log_item(item)
+
+    def _log_excerpt_index(
+        self,
+        *,
+        log_items_cache: Sequence[Mapping[str, Any]] | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        items = list(log_items_cache) if log_items_cache is not None else self.log_items()
+        return log_adapter.build_log_excerpt_index(items)
+
+    def _log_excerpt(self, trace_id: str) -> list[str]:
+        if not trace_id:
+            return []
+        return [entry["message"] for entry in self._log_excerpt_index().get(trace_id, [])[-8:]]
+
+    def _failed_log_excerpt_items(
+        self,
+        item: VideoItem,
+        trace_id: str,
+        log_excerpt_index: dict[str, list[dict[str, Any]]] | None,
+    ) -> list[dict[str, Any]]:
+        """按 trace_id 取失败日志片段，并交给稳定缓存避免刷新时片段忽隐忽现。"""
+        index = log_excerpt_index if log_excerpt_index is not None else self._log_excerpt_index()
+        entries = log_adapter.failed_log_excerpt_items(
+            item,
+            trace_id=trace_id,
+            index=index,
+            platform_label=self._platform_label,
+            trace_id_for_item=self._trace_id,
+        )
+        return self._stable_failed_log_excerpt_items(item, trace_id=trace_id, entries=entries)
+
+    def _stable_failed_log_excerpt_items(
+        self,
+        item: VideoItem,
+        *,
+        trace_id: str,
+        entries: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """失败原因未变时合并旧片段和新片段，避免日志滚动导致详情只剩最后一条。"""
+        video_id = str(item.id or "")
+        fresh_entries = [dict(entry) for entry in entries if isinstance(entry, Mapping)]
+        if not video_id:
+            return fresh_entries[-8:]
+
+        meta = item.meta or {}
+        cache_key = (
+            str(trace_id or ""),
+            str(meta.get("failed_at") or ""),
+            str(meta.get("download_error") or meta.get("error") or item.status or ""),
+        )
+        cached = self._failed_log_excerpt_cache.get(video_id)
+        if cached and cached[0] == cache_key:
+            fresh_entries = self._merge_log_excerpt_entries(cached[1], fresh_entries)
+
+        result = fresh_entries[-8:]
+        self._failed_log_excerpt_cache[video_id] = (cache_key, deepcopy(result))
+        return result
+
+    @staticmethod
+    def _merge_log_excerpt_entries(
+        existing: Sequence[Mapping[str, Any]],
+        fresh: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str, str, str]] = set()
+        for entry in [*existing, *fresh]:
+            if not isinstance(entry, Mapping):
+                continue
+            row = dict(entry)
+            key = (
+                str(row.get("time") or ""),
+                str(row.get("level") or ""),
+                str(row.get("source") or ""),
+                str(row.get("trace_id") or ""),
+                str(row.get("message") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(row)
+        return merged
+
+    def _queue_failed_records(self, failed_items: list[Mapping[str, Any]]) -> None:
+        """把当前失败投影写入持久存储；签名未变化的记录不会重复入队。"""
+        changed_items = self._changed_failed_records(failed_items)
+        if not changed_items:
+            return
+        try:
+            self.failed_record_store.queue_upsert(changed_items)
+        except Exception as exc:
+            debug_logger.log_exception(
+                "FrontendStateService",
+                "queue_failed_records",
+                exc,
+                details={"count": len(changed_items)},
+            )
+
+    def _changed_failed_records(self, failed_items: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+        changed_items: list[Mapping[str, Any]] = []
+        current_ids: set[str] = set()
+        for item in failed_items:
+            video_id = str(item.get("id") or item.get("video_id") or "")
+            if not video_id:
+                continue
+            current_ids.add(video_id)
+            signature = self._failed_record_signature(item)
+            if self._failed_record_write_signatures.get(video_id) == signature:
+                continue
+            self._failed_record_write_signatures[video_id] = signature
+            changed_items.append(item)
+        if current_ids:
+            for stale_id in set(self._failed_record_write_signatures) - current_ids:
+                self._failed_record_write_signatures.pop(stale_id, None)
+                self._failed_log_excerpt_cache.pop(stale_id, None)
+        else:
+            self._failed_record_write_signatures.clear()
+            self._failed_log_excerpt_cache.clear()
+        return changed_items
+
+    @staticmethod
+    def _failed_record_signature(item: Mapping[str, Any]) -> tuple[Any, ...]:
+        log_excerpt = tuple(str(value or "") for value in item.get("log_excerpt") or ())
+        log_excerpt_items = tuple(
+            (
+                str(entry.get("time") or ""),
+                str(entry.get("level") or ""),
+                str(entry.get("source") or ""),
+                str(entry.get("message") or ""),
+            )
+            for entry in item.get("log_excerpt_items") or ()
+            if isinstance(entry, Mapping)
+        )
+        return (
+            str(item.get("id") or item.get("video_id") or ""),
+            str(item.get("title") or ""),
+            str(item.get("failed_at") or item.get("failed_at_table") or ""),
+            str(item.get("reason") or item.get("reason_label") or ""),
+            str(item.get("reason_detail") or ""),
+            str(item.get("status") or item.get("status_label") or ""),
+            str(item.get("trace_id") or ""),
+            str(item.get("platform") or item.get("platform_label") or ""),
+            str(item.get("platform_id") or ""),
+            str(item.get("source_url") or ""),
+            log_excerpt,
+            log_excerpt_items,
+        )
+
+    def _fallback_failed_log_entries(
+        self,
+        item: VideoItem,
+        index: dict[str, list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        return log_adapter.fallback_failed_log_entries(
+            item,
+            index,
+            platform_label=self._platform_label,
+            trace_id_for_item=self._trace_id,
+        )
+
+    def _platform_auth_snapshot(
+        self,
+        plugin_id: str,
+        auth_cfg: Mapping[str, Any],
+        *,
+        force: bool = False,
+    ) -> dict[str, str]:
+        plugin_key = str(plugin_id or "").strip().lower()
+        signature = self._platform_auth_signature(plugin_key, auth_cfg)
+        now = time.monotonic()
+        cached = self._platform_auth_cache.get(plugin_key)
+        if (
+            not force
+            and cached
+            and cached.get("signature") == signature
+            and now < float(cached.get("expires_at") or 0)
+        ):
+            return dict(cached.get("value") or {})
+        value = settings_adapter.platform_auth_snapshot(plugin_key, auth_cfg)
+        self._platform_auth_cache[plugin_key] = {
+            "signature": signature,
+            "expires_at": now + float(self.PLATFORM_AUTH_REFRESH_TTL_SECONDS),
+            "value": dict(value),
+        }
+        return dict(value)
+
+    def _platform_auth_signature(self, plugin_id: str, auth_cfg: Mapping[str, Any]) -> tuple[Any, ...]:
+        spec = settings_adapter.resolve_platform_auth_spec(plugin_id)
+        if spec.mode != "cookie":
+            return (plugin_id, spec.mode)
+        file_key = spec.config_key
+        auth_url = spec.login_url
+        raw_path = str(auth_cfg.get(file_key) or "").strip()
+        if not raw_path:
+            return (plugin_id, file_key, auth_url, "")
+        path = Path(raw_path).expanduser()
+        try:
+            normalized_path = str(path.resolve(strict=False)).casefold()
+        except OSError:
+            normalized_path = str(path).replace("\\", "/").casefold()
+        try:
+            stat = path.stat()
+        except OSError:
+            return (plugin_id, file_key, auth_url, normalized_path, False, 0, 0)
+        return (plugin_id, file_key, auth_url, normalized_path, True, int(stat.st_mtime_ns), int(stat.st_size))
+
+    def _platform_auth_cache_has_expired(self) -> bool:
+        if not self._platform_auth_cache:
+            return False
+        now = time.monotonic()
+        return any(now >= float(entry.get("expires_at") or 0) for entry in self._platform_auth_cache.values())
+
+    @staticmethod
+    def _platform_auth_config_affects_status(section: str, key: str) -> bool:
+        normalized_section = str(section or "").strip().lower()
+        normalized_key = str(key or "").strip().lower()
+        return normalized_section == "auth" or "cookie" in normalized_key
+
+    def _invalidate_platform_auth_cache(self) -> None:
+        self._platform_auth_cache.clear()
+        self._static_snapshot_cache = None
+
+    @staticmethod
+    def _count_label(value: Any, unit: str) -> str:
+        return settings_adapter.count_label(value, unit)
+
+    @classmethod
+    def _platform_count_contract(cls, plugin_id: str, section: Mapping[str, Any]) -> dict[str, Any]:
+        return settings_adapter.platform_count_contract(plugin_id, section)
+
+    @staticmethod
+    def _platform_proxy_contract(plugin_id: str, section: Mapping[str, Any]) -> dict[str, Any]:
+        return settings_adapter.platform_proxy_contract(plugin_id, section)
+
+    @classmethod
+    def _platform_timeout_contract(cls, section: Mapping[str, Any]) -> dict[str, Any]:
+        return settings_adapter.platform_timeout_contract(section)
+
+    def settings_snapshot(self) -> dict[str, Any]:
+        force_auth = bool(self._platform_auth_force_refresh_once)
+        try:
+            return settings_adapter.build_settings_snapshot(
+                self.config.data,
+                self.download_options_snapshot(),
+                auth_status_provider=lambda plugin_id, auth_cfg: self._platform_auth_snapshot(
+                    plugin_id,
+                    auth_cfg,
+                    force=force_auth,
+                ),
+            )
+        finally:
+            self._platform_auth_force_refresh_once = False
+
+
+    def download_options_snapshot(self) -> dict[str, Any]:
+        """从配置、运行时覆盖项和下载管理器合并当前下载选项。"""
+        return settings_adapter.build_download_options_snapshot(
+            self.config.get,
+            self._download_runtime_get,
+            self._dl_manager(),
+        )
+
+    def app_status(
+        self,
+        *,
+        queue_count: int | None = None,
+        active_count: int | None = None,
+        completed_count: int | None = None,
+        failed_count: int | None = None,
+        active_downloads: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """构建顶部状态栏摘要；缺少计数时从当前视频桶实时统计。"""
+        if any(value is None for value in (queue_count, active_count, completed_count, failed_count)):
+            counts = self._video_bucket_counts()
+            if queue_count is None:
+                queue_count = counts["queue"]
+            if active_count is None:
+                active_count = counts["active"]
+            if completed_count is None:
+                completed_count = counts["completed"]
+            if failed_count is None:
+                failed_count = counts["failed"]
+        running = self._is_running()
+        if active_downloads is None:
+            if running:
+                partial = self._build_video_sections(shallow=True, only=frozenset({"active_downloads"}))
+                active_downloads = list(partial.get("active_downloads") or [])
+            else:
+                active_downloads = []
+        return status_adapter.build_app_status(
+            running=running,
+            running_state=self._running_state,
+            queue_count=int(queue_count or 0),
+            active_count=int(active_count or 0),
+            completed_count=int(completed_count or 0),
+            failed_count=int(failed_count or 0),
+            active_downloads=active_downloads,
+            version=load_runtime_release_identity().tag,
+        )
+
+    def _video_bucket_counts(self) -> dict[str, int]:
+        queued_ids = self._queued_video_ids()
+        active_ids = self._active_video_ids()
+        counts = {"queue": 0, "active": 0, "completed": 0, "failed": 0}
+        for item in self._videos(shallow=True).values():
+            bucket = self._bucket_for_item(item, queued_ids=queued_ids, active_ids=active_ids)
+            if bucket in counts:
+                counts[bucket] += 1
+        return counts
+
+    @staticmethod
+    def _format_transfer_speed(bps: int) -> str:
+        return status_adapter.format_transfer_speed(bps)
+
+    @staticmethod
+    def _parse_speed_string(value: str | None) -> int:
+        return status_adapter.parse_speed_string(value)
+
+    def _is_running(self) -> bool:
+        controller = self.controller
+        lock = getattr(controller, "_lifecycle_lock", None)
+        if lock is not None:
+            with lock:
+                spider = getattr(controller, "current_spider", None)
+        else:
+            spider = getattr(controller, "current_spider", None)
+        if spider is not None:
+            try:
+                if spider.isRunning():
+                    return True
+            except (RuntimeError, AttributeError) as exc:
+                debug_logger.log_exception(
+                    "FrontendStateService",
+                    "spider_running_state_check",
+                    exc,
+                    details={"spider_type": type(spider).__name__},
+                )
+        manager = self._dl_manager()
+        if manager is None:
+            return False
+        lock = getattr(manager, "_workers_lock", None)
+        if lock is not None:
+            with lock:
+                workers = list(getattr(manager, "workers", []) or [])
+        else:
+            workers = list(getattr(manager, "workers", []) or [])
+        return len(workers) > 0
+
+    @staticmethod
+    def _aggregate_speed(active_downloads: list[dict[str, Any]]) -> str:
+        return status_adapter.aggregate_speed(active_downloads)
+
+    def _action_delete_item(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        video_id = str(payload.get("id") or payload.get("video_id") or "")
+        if not video_id:
+            return FrontendActionResult("error", "missing video id")
+        controller = self.controller
+        outcome = None
+        if controller is not None and hasattr(controller, "delete_video"):
+            outcome = controller.delete_video(video_id)
+        elif controller is not None and hasattr(controller, "_delete_video_sync"):
+            outcome = controller._delete_video_sync(video_id)
+        else:
+            self.remove_video(video_id)
+        result = self._delete_action_result_from_outcome(video_id, outcome)
+        if result is not None:
+            return result
+        return FrontendActionResult("ok", "deleted", {"video_id": video_id})
+
+    @staticmethod
+    def _delete_action_result_from_outcome(
+        video_id: str,
+        outcome: Any,
+    ) -> FrontendActionResult | None:
+        if outcome is None:
+            return None
+        if isinstance(outcome, Mapping):
+            status = str(outcome.get("status") or "")
+            message = str(outcome.get("message") or "")
+            data = dict(outcome.get("data") or {})
+        else:
+            status = str(getattr(outcome, "status", "") or "")
+            message = str(getattr(outcome, "error", None) or "")
+            data = {"video_id": video_id}
+            if hasattr(outcome, "deleted"):
+                data["deleted"] = bool(getattr(outcome, "deleted", False))
+            if status == "missing":
+                data["missing"] = True
+        if not status:
+            return None
+        if status == "error":
+            return FrontendActionResult("error", message or "delete failed", data or {"video_id": video_id})
+        if status == "missing":
+            return FrontendActionResult(
+                "ok",
+                message or "already deleted",
+                data or {"video_id": video_id, "missing": True},
+            )
+        if status == "ok":
+            return FrontendActionResult("ok", message or "deleted", data or {"video_id": video_id})
+        return FrontendActionResult("error", message or f"delete failed: {status}", data or {"video_id": video_id})
+
+    def _action_delete_failed_record(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        video_id = str(payload.get("id") or payload.get("video_id") or "")
+        if not video_id:
+            return FrontendActionResult("error", "missing failed record id")
+        live_deleted = False
+        if self._video_for_update(video_id) is not None:
+            live_result = self._action_delete_item({"video_id": video_id})
+            if live_result.status != "ok":
+                return live_result
+            live_deleted = True
+        delete_record = getattr(self.failed_record_store, "delete_record", None)
+        deleted = False
+        if callable(delete_record):
+            try:
+                deleted = bool(delete_record(video_id))
+            except Exception as exc:
+                debug_logger.log_exception(
+                    "FrontendStateService",
+                    "delete_failed_record",
+                    exc,
+                    details={"video_id": video_id},
+                )
+                return FrontendActionResult("error", f"delete failed record failed: {exc}", {"video_id": video_id})
+        self.record_event("failed_records.refresh", {"video_id": video_id, "deleted": deleted or live_deleted})
+        return FrontendActionResult(
+            "ok",
+            "failed record deleted" if deleted or live_deleted else "failed record already deleted",
+            {"video_id": video_id, "deleted": deleted or live_deleted},
+        )
+
+    def _action_clear_failed_records(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        del payload
+        queued_ids, active_ids = self._queued_video_ids(), self._active_video_ids()
+        failed_ids = [
+            item.id
+            for item in self._videos(shallow=True).values()
+            if item.id and self._bucket_for_item(item, queued_ids=queued_ids, active_ids=active_ids) == "failed"
+        ]
+        delete_errors = []
+        for video_id in failed_ids:
+            result = self._action_delete_item({"video_id": video_id})
+            if result.status != "ok":
+                delete_errors.append(f"{video_id}: {result.message}")
+        clear_records = getattr(self.failed_record_store, "clear_records", None)
+        if not callable(clear_records):
+            return FrontendActionResult("error", "failed record store is unavailable")
+        try:
+            deleted_count = int(clear_records())
+        except Exception as exc:
+            debug_logger.log_exception(
+                "FrontendStateService",
+                "clear_failed_records",
+                exc,
+            )
+            return FrontendActionResult("error", f"clear failed records failed: {exc}")
+        self.record_event("failed_records.refresh", {"count": deleted_count, "cleared": True})
+        if delete_errors:
+            return FrontendActionResult("error", "; ".join(delete_errors), {"count": deleted_count})
+        return FrontendActionResult("ok", "failed records cleared", {"count": deleted_count})
+
+    def _action_clear_queue(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        del payload
+        queue_ids = sorted(self.queue_item_ids())
+        clear_queue = getattr(self.controller, "on_clear_queue", None)
+        if callable(clear_queue):
+            clear_queue()
+        else:
+            controller_videos = getattr(self.controller, "videos", None)
+            if isinstance(controller_videos, dict):
+                for video_id in queue_ids:
+                    controller_videos.pop(video_id, None)
+            for video_id in queue_ids:
+                self.remove_video(video_id)
+        if queue_ids:
+            self._emit_frontend_event(
+                "videos.clear_queue",
+                {"video_ids": queue_ids, "count": len(queue_ids)},
+            )
+        return FrontendActionResult("ok", "queue cleared", {"count": len(queue_ids), "video_ids": queue_ids})
+
+    def _action_pause_download(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        video_id = str(payload.get("id") or payload.get("video_id") or "")
+        if not video_id:
+            return FrontendActionResult("error", "missing video id")
+        manager = self._dl_manager()
+        cancel_task = getattr(manager, "cancel_task", None)
+        if not callable(cancel_task):
+            return FrontendActionResult("error", "download manager is unavailable")
+        result = cancel_task(video_id)
+        if result is None:
+            return FrontendActionResult("error", "download task not found", {"video_id": video_id})
+        item = self._video_for_update(video_id)
+        if item is not None:
+            item.status = VideoStatus.PENDING.label
+            item.meta["frontend_status"] = "待下载"
+            item.meta["user_cancel_requested"] = True
+            app_state = getattr(self, "app_state", None)
+            if app_state is not None:
+                app_state._publish_change(
+                    "videos.update",
+                    {"video_id": video_id, "scope": result},
+                )
+        return FrontendActionResult("ok", "download paused", {"video_id": video_id, "scope": result})
+
+    def _action_update_download_options(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        try:
+            self._validate_boolean_fields(
+                payload,
+                ("auto_retry", "video_only", "image_respects_concurrency"),
+            )
+            options = settings_adapter.normalize_download_options_payload(
+                payload,
+                self.config.get,
+                self._download_runtime_get,
+            )
+        except (ConfigValidationError, TypeError, ValueError) as exc:
+            return FrontendActionResult("error", f"download options update failed: {exc}")
+        manager = self._dl_manager()
+        if not self._config_events_drive_runtime:
+            options["max_concurrent"] = settings_adapter.apply_manager_concurrency(
+                manager,
+                options["max_concurrent"],
+            )
+        runtime_failures: list[tuple[str, str, Exception]] = []
+        try:
+            with self._capture_config_runtime_failures() as runtime_failures:
+                settings_adapter.persist_download_options(
+                    self.config.set,
+                    self.cache_service.set,
+                    options,
+                    config_set_many=getattr(self.config, "set_many", None),
+                )
+        except (ConfigValidationError, ConfigWriteError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            return FrontendActionResult("error", f"download options update failed: {exc}")
+        self._download_runtime_options["auto_retry"] = bool(options.get("auto_retry", True))
+        if runtime_failures:
+            return FrontendActionResult(
+                "error",
+                self._runtime_failure_message("download options", runtime_failures),
+                options,
+            )
+        if not self._config_events_drive_runtime and callable(getattr(manager, "set_runtime_options", None)):
+            try:
+                self._apply_runtime_setting("download", "download_options", None)
+            except Exception as exc:
+                debug_logger.log_exception(
+                    "FrontendStateService",
+                    "apply_download_options",
+                    exc,
+                    details={
+                        "max_concurrent": options["max_concurrent"],
+                        "max_retries": options["max_retries"],
+                        "video_only": options["video_only"],
+                        "image_respects_concurrency": options["image_respects_concurrency"],
+                    },
+                )
+                return FrontendActionResult("error", f"download options persisted but runtime apply failed: {exc}")
+        if not self._config_events_drive_runtime:
+            self._static_snapshot_cache = None
+            self.record_event(
+                "settings.update",
+                {
+                    "section": "download",
+                    "max_concurrent": options["max_concurrent"],
+                    "video_only": options["video_only"],
+                    "image_respects_concurrency": options["image_respects_concurrency"],
+                    "download_options": True,
+                },
+            )
+        return FrontendActionResult("ok", "download options updated", options)
+
+    def _action_update_setting(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        section = str(payload.get("section") or payload.get("group") or "").strip()
+        key = str(payload.get("key") or payload.get("name") or "").strip()
+        value = payload.get("value")
+        if section == "basic":
+            section = "common"
+        if section == "appearance" and key == "theme":
+            section = "common"
+        if not section or not key:
+            return FrontendActionResult("error", "setting section and key are required")
+        try:
+            default = get_setting_default(section, key)
+        except ConfigValidationError:
+            default = None
+        if isinstance(default, bool) and not isinstance(value, bool):
+            return FrontendActionResult("error", f"{section}.{key} must be a boolean")
+        if section == "common":
+            return self._action_update_basic_setting({"key": key, "value": value})
+        if section == "download" and key in {"max_concurrent", "max_retries", "video_only", "image_respects_concurrency"}:
+            options = self.download_options_snapshot()
+            options[key] = value
+            return self._action_update_download_options(options)
+        section_models = getattr(self.config, "SECTION_MODELS", {})
+        if section not in section_models:
+            return FrontendActionResult("error", f"unknown setting section: {section}")
+        try:
+            if section == "missav" and key in {"proxy_app", "proxy_url"}:
+                proxy_text = str(value or "").strip()
+                proxy_url = (
+                    str(self.config.get("missav", "proxy_url", "") or "").strip()
+                    if key == "proxy_app" and proxy_text == "自定义"
+                    else build_missav_proxy_url(proxy_text)
+                )
+                proxy_app = proxy_text if key == "proxy_app" else "自定义"
+                updater = getattr(self.config, "update_missav_proxy", None)
+                if callable(updater):
+                    updater(proxy_app or "自定义", proxy_url)
+                else:
+                    self.config.set("missav", key, value)
+                    if key == "proxy_app":
+                        self.config.set("missav", "proxy_url", proxy_url)
+                    elif key == "proxy_url":
+                        self.config.set("missav", "proxy_app", "自定义")
+                current_value = self.config.get("missav", key)
+                if not self._config_events_drive_runtime:
+                    self._static_snapshot_cache = None
+                    self.record_event("settings.update", {"section": section, "key": key})
+                return FrontendActionResult(
+                    "ok",
+                    "setting updated",
+                    {"section": section, "key": key, "value": current_value, "proxy_url": proxy_url},
+                )
+            with self._capture_config_runtime_failures() as runtime_failures:
+                self.config.set(section, key, value)
+                current_value = self.config.get(section, key)
+                if not self._config_events_drive_runtime:
+                    self._apply_runtime_setting(section, key, current_value)
+        except (ConfigValidationError, ConfigWriteError) as exc:
+            return FrontendActionResult("error", str(exc), {"section": section, "key": key})
+        except Exception as exc:
+            debug_logger.log_exception(
+                "FrontendStateService",
+                "apply_runtime_setting",
+                exc,
+                details={"section": section, "key": key},
+            )
+            return FrontendActionResult(
+                "error",
+                f"setting persisted but runtime apply failed: {exc}",
+                {"section": section, "key": key},
+            )
+        if runtime_failures:
+            return FrontendActionResult(
+                "error",
+                self._runtime_failure_message("setting", runtime_failures),
+                {"section": section, "key": key, "value": current_value},
+            )
+        if not self._config_events_drive_runtime:
+            if self._platform_auth_config_affects_status(section, key):
+                self._invalidate_platform_auth_cache()
+            else:
+                self._static_snapshot_cache = None
+            self.record_event("settings.update", {"section": section, "key": key})
+        return FrontendActionResult(
+            "ok",
+            "setting updated",
+            {"section": section, "key": key, "value": current_value},
+        )
+
+    def _action_retry_failed(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        video_id = str(payload.get("id") or payload.get("video_id") or "")
+        item = self._video_for_update(video_id)
+        manager = self._dl_manager()
+        if not item or manager is None:
+            return FrontendActionResult("error", "task cannot be retried")
+        item.status = VideoStatus.PENDING.label
+        item.progress = 0
+        manager.add_task(item, self._current_save_dir())
+        return FrontendActionResult("ok", "retry queued", {"video_id": video_id})
+
+    def _action_copy_diagnostics(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        video_id = str(payload.get("id") or payload.get("video_id") or "")
+        item = self._videos().get(video_id)
+        trace_id = self._trace_id(item) if item else ""
+        if not trace_id and video_id:
+            record = self._failed_record_for_id(video_id)
+            trace_id = str((record or {}).get("trace_id") or "")
+        if not item and not trace_id:
+            return FrontendActionResult("error", "task not found")
+        if not trace_id:
+            return FrontendActionResult("error", "trace id not found", {"video_id": video_id})
+        return FrontendActionResult("ok", "trace id ready", {"text": trace_id, "trace_id": trace_id})
+
+    def _failed_record_for_id(self, video_id: str) -> dict[str, Any] | None:
+        normalized_id = str(video_id or "")
+        if not normalized_id:
+            return None
+        for row in self._failed_record_snapshot_items():
+            if str(row.get("id") or row.get("video_id") or "") == normalized_id:
+                return row
+        record_by_id = getattr(self.failed_record_store, "record_by_id", None)
+        if not callable(record_by_id):
+            return None
+        try:
+            row = record_by_id(normalized_id)
+        except Exception as exc:
+            debug_logger.log_exception(
+                "FrontendStateService",
+                "failed_record_store.record_by_id",
+                exc,
+                details={"video_id": normalized_id},
+            )
+            return None
+        return dict(row) if isinstance(row, Mapping) else None
+
+    def _action_update_basic_setting(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        key = str(payload.get("key") or payload.get("name") or "").strip()
+        value = payload.get("value")
+        aliases = {"download_directory": "save_directory", "save_directory": "save_directory"}
+        config_key = aliases.get(key, key)
+        allowed = {
+            "save_directory",
+            "last_source",
+            "filename_template",
+            "open_after_download",
+            "default_open_mode",
+            "show_browser_window",
+            "theme",
+        }
+        if config_key not in allowed:
+            return FrontendActionResult("error", f"unknown basic setting: {key}")
+        try:
+            default = get_setting_default("common", config_key)
+        except ConfigValidationError:
+            default = None
+        if isinstance(default, bool) and not isinstance(value, bool):
+            return FrontendActionResult("error", f"common.{config_key} must be a boolean")
+        if config_key == "save_directory" and value is None:
+            value = payload.get("directory")
+        runtime_failures: list[tuple[str, str, Exception]] = []
+        try:
+            with self._capture_config_runtime_failures() as runtime_failures:
+                manual = self._strict_boolean(payload, "manual", default=True)
+                manual_theme = config_key == "theme" and manual
+                set_batch = getattr(self.config, "set_batch", None)
+                if manual_theme and callable(set_batch):
+                    set_batch(
+                        {
+                            "appearance": {"follow_system": False},
+                            "common": {config_key: value},
+                        }
+                    )
+                else:
+                    if manual_theme:
+                        self.config.set("appearance", "follow_system", False)
+                    self.config.set("common", config_key, value)
+                current_value = self.config.get("common", config_key)
+                if not self._config_events_drive_runtime:
+                    self._apply_runtime_setting("common", config_key, current_value)
+        except (ConfigValidationError, ConfigWriteError) as exc:
+            return FrontendActionResult("error", str(exc), {"key": key or config_key})
+        except Exception as exc:
+            debug_logger.log_exception(
+                "FrontendStateService",
+                "apply_basic_runtime_setting",
+                exc,
+                details={"key": config_key},
+            )
+            return FrontendActionResult(
+                "error",
+                f"setting persisted but runtime apply failed: {exc}",
+                {"key": key or config_key},
+            )
+        if runtime_failures:
+            return FrontendActionResult(
+                "error",
+                self._runtime_failure_message("setting", runtime_failures),
+                {"section": "common", "key": key or config_key, "config_key": config_key, "value": current_value},
+            )
+        controller = self.controller
+        if config_key == "save_directory" and controller is not None and hasattr(controller, "current_save_dir"):
+            controller.current_save_dir = str(current_value)
+        if not self._config_events_drive_runtime:
+            self._static_snapshot_cache = None
+            self.record_event("settings.update", {"section": "common", "key": config_key})
+        data = {"section": "common", "key": key or config_key, "config_key": config_key, "value": current_value}
+        if config_key == "save_directory":
+            data["directory"] = current_value
+        return FrontendActionResult("ok", "basic setting updated", data)
+
+    def _action_change_directory(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        return self._action_update_basic_setting({
+            "key": "download_directory",
+            "value": payload.get("directory"),
+        })
+
+    def _action_open_directory(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        video_id = str(payload.get("id") or payload.get("video_id") or "")
+        item = self._videos().get(video_id)
+        file_path = getattr(item, "local_path", "") if item else ""
+        if not file_path:
+            return FrontendActionResult("error", "file path is unavailable")
+        directory_path = Path(file_path).expanduser().parent
+        if not directory_path.exists():
+            return FrontendActionResult("error", "directory does not exist", {"directory": str(directory_path)})
+        directory = str(directory_path)
+        try:
+            self._directory_opener(directory)
+        except Exception as exc:
+            return FrontendActionResult("error", str(exc), {"directory": directory})
+        return FrontendActionResult("ok", "directory opened", {"directory": directory})
+
+    def _action_open_file(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        video_id = str(payload.get("id") or payload.get("video_id") or "")
+        item = self._videos().get(video_id)
+        file_path = getattr(item, "local_path", "") if item else ""
+        if not file_path:
+            return FrontendActionResult("error", "file path is unavailable")
+        path = Path(file_path).expanduser()
+        if not path.exists():
+            return FrontendActionResult("error", "file does not exist", {"path": str(path)})
+        try:
+            self._open_file_path(path)
+        except Exception as exc:
+            return FrontendActionResult("error", str(exc), {"path": str(path)})
+        return FrontendActionResult("ok", "file opened", {"path": str(path)})
+
+
+    def _action_register_file_associations(self, payload: Mapping[str, Any]) -> FrontendActionResult:
+        try:
+            include_video = self._strict_boolean(payload, "include_video", default=True)
+            include_image = self._strict_boolean(payload, "include_image", default=True)
+        except ConfigValidationError as exc:
+            return FrontendActionResult("error", str(exc))
+        if not include_video and not include_image:
+            return FrontendActionResult("error", "no file type selected")
+        try:
+            service = self._make_association_service()
+            result = service.register_current_user(
+                self._executable_path_provider(),
+                include_video=include_video,
+                include_image=include_image,
+            )
+            if not getattr(result, "registered", False):
+                return FrontendActionResult("error", getattr(result, "message", "") or "file association registration failed")
+
+            default_result = service.set_current_user_defaults(include_video=include_video, include_image=include_image)
+            diagnostics = service.diagnose_current_user(include_video=include_video, include_image=include_image)
+            pending = tuple(getattr(diagnostics, "pending_extensions", ()) or ())
+            opened_settings = False
+            if getattr(diagnostics, "available", False) and pending:
+                opened_settings = bool(service.open_default_apps_settings())
+
+            failed = tuple(getattr(default_result, "failed_extensions", ()) or ())
+            defaulted = tuple(getattr(default_result, "defaulted_extensions", ()) or ())
+            if pending:
+                message = "default apps settings opened" if opened_settings else "manual default app confirmation required"
+            elif failed:
+                message = "some defaults failed"
+            elif defaulted:
+                message = "default file associations applied"
+            else:
+                message = getattr(default_result, "message", "") or "file association action completed"
+            return FrontendActionResult(
+                "ok",
+                message,
+                {
+                    "defaulted_extensions": list(defaulted),
+                    "failed_extensions": list(failed),
+                    "pending_extensions": list(pending),
+                    "opened_settings": opened_settings,
+                },
+            )
+        except Exception as exc:
+            return FrontendActionResult("error", str(exc))
+
+    def _make_association_service(self) -> Any:
+        if self._association_service_factory is not None:
+            return self._association_service_factory()
+        from app.services.windows_file_association_service import WindowsFileAssociationService
+
+        return WindowsFileAssociationService()
+
+    @staticmethod
+    def _open_directory_with_system(directory: str) -> None:
+        file_actions.open_directory_with_system(directory)
+
+    @staticmethod
+    def _current_executable_path() -> str:
+        return file_actions.current_executable_path()
+
+    def _current_save_dir(self) -> str:
+        controller_dir = getattr(self.controller, "current_save_dir", "")
+        if controller_dir:
+            return str(controller_dir)
+        host = getattr(self.controller, "host", None)
+        host_dir = getattr(host, "current_save_dir", "")
+        if host_dir:
+            return str(host_dir)
+        return str(self.config.get("common", "save_directory", "downloads"))
+
+    @classmethod
+    def mock_snapshot(cls) -> dict[str, Any]:
+        from app.services.frontend_mock_snapshot import build_mock_snapshot
+
+        temp_service = cls()
+        try:
+            return build_mock_snapshot(
+                temp_service.settings_snapshot,
+                cls._settings_contract_payload,
+            )
+        finally:
+            temp_service.destroy()

@@ -1,0 +1,165 @@
+"""抖音作品解析，把 aweme 原始结构转换为 VideoItem。"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from app.debug_logger import debug_logger
+from app.models import VideoItem
+
+
+class DouyinItemParser:
+    """兼容视频、图集和实况照片三类作品的轻量解析器。"""
+
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _last_video_url(cls, urls: Any) -> str:
+        if isinstance(urls, str):
+            return "" if ".mp3" in urls.lower() else urls
+        if not isinstance(urls, (list, tuple)):
+            return ""
+        for url in reversed(urls):
+            if isinstance(url, str) and url and ".mp3" not in url.lower():
+                return url
+        return ""
+
+    @classmethod
+    def _select_video_url(cls, video: Any) -> str:
+        """从 bit_rate 候选中选择质量最高的视频地址，过滤误混入的音频地址。"""
+        if not isinstance(video, dict):
+            return ""
+
+        candidates: list[tuple[int, int, int, int, str]] = []
+        for item in video.get("bit_rate") or []:
+            if not isinstance(item, dict):
+                continue
+            play_addr = item.get("play_addr") or {}
+            if not isinstance(play_addr, dict):
+                continue
+            url = cls._last_video_url(play_addr.get("url_list"))
+            if not url:
+                continue
+            height = cls._safe_int(play_addr.get("height"))
+            width = cls._safe_int(play_addr.get("width"))
+            fps = cls._safe_int(item.get("FPS", item.get("fps")))
+            bitrate = cls._safe_int(item.get("bit_rate"))
+            data_size = cls._safe_int(play_addr.get("data_size"))
+            candidates.append((max(height, width), fps, bitrate, data_size, url))
+
+        if candidates:
+            # 排序维度依次偏向分辨率、帧率、码率和体积，避免只按列表顺序拿到低清流。
+            candidates.sort(key=lambda candidate: candidate[:4])
+            return candidates[-1][-1]
+
+        play_addr = video.get("play_addr") or {}
+        if isinstance(play_addr, dict):
+            return cls._last_video_url(play_addr.get("url_list"))
+        return ""
+
+    def parse_aweme(self, data: dict[str, Any]) -> VideoItem | None:
+        """解析单个 aweme；图集先汇总为一个逻辑项，后续再展开为多个下载项。"""
+        try:
+            aweme_id = data.get("aweme_id", "unknown")
+            trace_aweme_id = str(aweme_id).replace("-", "_")
+            desc = data.get("desc", aweme_id)
+            create_time = data.get("create_time", 0)
+            author = data.get("author", {}).get("nickname", "Unknown")
+
+            video_url = ""
+            video = data.get("video", {})
+            video_url = self._select_video_url(video)
+
+            is_real_video = bool(video_url and ".mp3" not in video_url.lower())
+
+            images_data: list[dict[str, Any]] = []
+            has_live_photo = False
+            for image in data.get("images") or []:
+                clip_type = image.get("clip_type", 2)
+                image_url = ""
+                for candidate in image.get("url_list") or []:
+                    if "~noop" in candidate:
+                        image_url = candidate
+                        break
+                if not image_url and image.get("url_list"):
+                    image_url = image["url_list"][-1]
+
+                live_video_url = ""
+                if clip_type == 3 and "video" in image:
+                    # clip_type=3 是实况图，下载时应优先保存其动态视频而非静态图。
+                    live_addr = image["video"].get("play_addr_h264") or image["video"].get("play_addr")
+                    if live_addr:
+                        live_urls = live_addr.get("url_list", [])
+                        if live_urls:
+                            live_video_url = live_urls[-1]
+                            has_live_photo = True
+                images_data.append(
+                    {
+                        "image_url": image_url,
+                        "live_video_url": live_video_url,
+                        "clip_type": clip_type,
+                    }
+                )
+
+            duration_ms = video.get("duration", 0)
+            if is_real_video and not images_data:
+                item = VideoItem(url=video_url, title=desc, source="douyin")
+                item.meta = {
+                    "trace_id": f"dy_{trace_aweme_id}",
+                    "content_type": "video",
+                    "media_label": "视频",
+                    "aweme_id": aweme_id,
+                    "create_time": create_time,
+                    "author": author,
+                    "folder_name": author,
+                    "duration": duration_ms // 1000,
+                }
+                return item
+
+            if images_data:
+                item = VideoItem(url=images_data[0]["image_url"], title=desc, source="douyin")
+                item.meta = {
+                    "trace_id": f"dy_{trace_aweme_id}",
+                    "content_type": "gallery",
+                    "media_label": "实况" if has_live_photo else "图集",
+                    "is_gallery": True,
+                    "has_live_photo": has_live_photo,
+                    "images_data": images_data,
+                    "aweme_id": aweme_id,
+                    "create_time": create_time,
+                    "author": author,
+                    "folder_name": author,
+                }
+                return item
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
+            debug_logger.log_exception(
+                "DouyinItemParser",
+                "parse_aweme",
+                exc,
+                details={
+                    "aweme_id": data.get("aweme_id") if isinstance(data, dict) else None,
+                    "payload_type": type(data).__name__,
+                },
+            )
+        return None
+
+    def summarize_aweme(self, data: dict[str, Any]) -> dict[str, Any]:
+        """生成调试摘要，避免日志里直接暴露或刷入完整平台响应。"""
+        video = data.get("video", {}) or {}
+        author = data.get("author", {}) or {}
+        images = data.get("images") or []
+        return {
+            "aweme_id": data.get("aweme_id"),
+            "desc": data.get("desc"),
+            "author": author.get("nickname"),
+            "aweme_type": data.get("aweme_type"),
+            "has_video": bool(video.get("play_addr")),
+            "duration_ms": video.get("duration", 0),
+            "image_count": len(images),
+            "has_live_photo": any((img.get("clip_type") == 3) for img in images),
+        }

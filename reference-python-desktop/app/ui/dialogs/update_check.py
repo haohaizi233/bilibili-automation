@@ -1,0 +1,779 @@
+"""提供主题化更新检测结果对话框。"""
+
+from __future__ import annotations
+
+from html import escape
+from typing import Any
+from unicodedata import category
+from urllib.parse import unquote_to_bytes
+
+from PyQt6.QtCore import QRectF, Qt, QTimer, QUrl, QVariant, pyqtSignal
+from PyQt6.QtGui import QColor, QDesktopServices, QPainter, QPen
+from PyQt6.QtWidgets import (
+    QFrame, QGridLayout, QHBoxLayout, QLabel, QProgressBar,
+    QPushButton, QSizePolicy, QTextBrowser, QVBoxLayout, QWidget,
+)
+
+from app.ui.components.combo_popup import ThemedComboBox
+from app.ui.dialogs.chromed_dialog import ChromedDialog
+from app.ui.dialogs.update_candidate_options import normalize_update_candidates
+from shared.localization import normalize_language, tr
+from shared.version import format_version_label
+
+
+_PROJECT_RELEASE_HOST = "github.com"
+_PROJECT_RELEASE_OWNER = "haohaizi554"
+_PROJECT_RELEASE_REPOSITORY = "universalcrawler"
+_FULLY_ENCODED = QUrl.ComponentFormattingOption.FullyEncoded
+_AMBIGUOUS_PATH_CHARACTERS = frozenset("/\\?#")
+_MAX_RELEASE_PATH_DECODE_ROUNDS = 8
+
+
+def _fully_decode_release_path_segment(encoded_segment: str) -> str | None:
+    """Return one semantic decode after rejecting nested ambiguous data."""
+
+    if not encoded_segment.isascii():
+        return None
+    raw = encoded_segment.encode("ascii")
+    semantic = unquote_to_bytes(raw)
+    current = raw
+    for _ in range(_MAX_RELEASE_PATH_DECODE_ROUNDS):
+        decoded = unquote_to_bytes(current)
+        if decoded == current:
+            break
+        current = decoded
+    else:
+        if unquote_to_bytes(current) != current:
+            return None
+
+    try:
+        segment = current.decode("utf-8", errors="strict")
+        semantic_segment = semantic.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if segment in {".", ".."}:
+        return None
+    if any(
+        character in _AMBIGUOUS_PATH_CHARACTERS
+        or category(character).startswith("C")
+        for character in segment
+    ):
+        return None
+    return semantic_segment
+
+
+class _ReleaseNotesBrowser(QTextBrowser):
+    """Render signed release text without resolving embedded resources."""
+
+    def loadResource(self, _resource_type, _name):  # noqa: N802
+        return QVariant()
+
+
+class UpdateStatusIcon(QWidget):
+    """更新对话框使用的紧凑自绘状态图标。"""
+
+    def __init__(self, *, status: str, colors: dict[str, str], parent=None) -> None:
+        super().__init__(parent)
+        self._status = status
+        self._colors = dict(colors)
+        self._spin_angle = 0
+        self._spin_timer = QTimer(self)
+        self._spin_timer.setInterval(48)
+        self._spin_timer.timeout.connect(self._advance_spinner)
+        self.setObjectName("UpdateStatusIcon")
+        self.setFixedSize(46, 46)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def set_status(self, status: str, colors: dict[str, str]) -> None:
+        self._status = status
+        self._colors = dict(colors)
+        self._sync_spinner_timer()
+        self.update()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._sync_spinner_timer()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        # 不可见时停止 QTimer，避免已隐藏对话框继续触发重绘。
+        self._spin_timer.stop()
+        super().hideEvent(event)
+
+    def _sync_spinner_timer(self) -> None:
+        if self._status == "checking" and self.isVisible():
+            self._spin_timer.start()
+        else:
+            self._spin_timer.stop()
+
+    def _advance_spinner(self) -> None:
+        self._spin_angle = (self._spin_angle - 12) % 360
+        self.update()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        color = QColor(self._status_color())
+        soft = QColor(color)
+        soft.setAlpha(34)
+        painter.setPen(QPen(color, 1.6))
+        painter.setBrush(soft)
+        painter.drawEllipse(3, 3, 40, 40)
+
+        pen = QPen(color, 3.0)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        status = self._status
+        if status == "checking":
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawArc(QRectF(11, 11, 24, 24), self._spin_angle * 16, 250 * 16)
+        elif status == "current":
+            painter.drawLine(15, 24, 21, 30)
+            painter.drawLine(21, 30, 32, 17)
+        elif status == "available":
+            painter.drawLine(23, 32, 23, 15)
+            painter.drawLine(23, 15, 16, 22)
+            painter.drawLine(23, 15, 30, 22)
+            painter.drawLine(16, 34, 30, 34)
+        elif status == "local_newer":
+            painter.drawLine(15, 28, 23, 16)
+            painter.drawLine(23, 16, 31, 28)
+            painter.drawLine(18, 30, 28, 30)
+        elif status == "error":
+            painter.drawLine(23, 14, 23, 27)
+            painter.drawPoint(23, 34)
+        else:
+            painter.drawLine(23, 21, 23, 32)
+            painter.drawPoint(23, 15)
+
+    def _status_color(self) -> str:
+        if self._status == "checking":
+            return self._colors["accent"]
+        if self._status == "current":
+            return self._colors["success"]
+        if self._status == "available":
+            return self._colors["accent"]
+        if self._status == "local_newer":
+            return self._colors["warning"]
+        if self._status == "error":
+            return self._colors["danger"]
+        return self._colors["muted"]
+
+
+class UpdateCheckDialog(ChromedDialog):
+    """展示更新检测结果详情的主题化对话框。"""
+
+    SKIP_CODE = 2
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        title: str,
+        message: str,
+        details: str = "",
+        primary_text: str = "确定",
+        secondary_text: str = "",
+        skip_text: str = "",
+        status: str = "info",
+        local_version: str = "",
+        latest_version: str = "",
+        release_url: str = "",
+        selected_candidate_id: str = "",
+        candidates: tuple[Any, ...] = (),
+        language: str = "zh-CN",
+    ) -> None:
+        self._language = normalize_language(language)
+        self._status = status or "info"
+        self.details_browser: QTextBrowser | None = None
+        self._rendered_details = ""
+        super().__init__(
+            parent,
+            title=self._tr(title),
+            object_name="UpdateCheckDialog",
+            body_margins=(24, 22, 24, 20),
+            body_spacing=16,
+            show_minimize=True,
+            show_maximize=True,
+        )
+        if self._status == "checking":
+            self.setMinimumSize(620, 360)
+            self.resize(680, 420)
+        else:
+            self.setMinimumSize(680, 560)
+            self.resize(760, 720)
+        self._release_url = str(release_url or "").strip()
+        self._initial_details = str(details or "")
+        self._candidate_options = normalize_update_candidates(
+            candidates,
+            latest_version=latest_version,
+            release_url=release_url,
+            selected_candidate_id=selected_candidate_id,
+        )
+        self._selected_version = self._candidate_options[0]["version"] if self._candidate_options else str(latest_version or "")
+        self._selected_candidate_id = self._candidate_options[0]["candidate_id"] if self._candidate_options else ""
+        self.release_link: QLabel | None = None
+
+        layout = self.content_layout
+        layout.addWidget(self._build_header(self._tr(title), self._tr(message)))
+        layout.addWidget(self._build_version_panel(local_version, latest_version))
+        if self._status == "checking":
+            layout.addWidget(self._build_checking_indicator())
+        if len(self._candidate_options) > 1:
+            layout.addWidget(self._build_candidate_selector())
+        if details or self._release_url:
+            layout.addWidget(self._build_detail_card(details))
+        layout.addLayout(self._build_button_row(primary_text, secondary_text, skip_text))
+        if self._status == "checking":
+            self.primary_button.setEnabled(False)
+
+    def _build_checking_indicator(self) -> QProgressBar:
+        self.busy_bar = QProgressBar()
+        self.busy_bar.setObjectName("UpdateCheckBusyBar")
+        self.busy_bar.setRange(0, 0)
+        self.busy_bar.setTextVisible(False)
+        self.busy_bar.setFixedHeight(8)
+        self.busy_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.busy_bar.setAccessibleName(self._tr("正在检查更新..."))
+        return self.busy_bar
+
+    def _build_header(self, title: str, message: str) -> QWidget:
+        hero = QFrame()
+        hero.setObjectName("UpdateHero")
+        hero.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        hero_layout = QHBoxLayout(hero)
+        hero_layout.setContentsMargins(0, 0, 0, 0)
+        hero_layout.setSpacing(14)
+
+        self.status_icon = UpdateStatusIcon(status=self._status, colors=self._colors, parent=hero)
+        hero_layout.addWidget(self.status_icon, 0, Qt.AlignmentFlag.AlignTop)
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(8)
+
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(10)
+        title_label = QLabel(title)
+        title_label.setObjectName("DialogTitle")
+        title_row.addWidget(title_label, 1)
+
+        self.status_badge = QLabel(self._status_badge_text())
+        self.status_badge.setObjectName("UpdateStatusBadge")
+        self.status_badge.setProperty("tone", self._status_tone())
+        self.status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_row.addWidget(self.status_badge, 0, Qt.AlignmentFlag.AlignTop)
+        text_col.addLayout(title_row)
+
+        message_label = QLabel(message)
+        message_label.setObjectName("DialogBody")
+        message_label.setWordWrap(True)
+        text_col.addWidget(message_label)
+        hero_layout.addLayout(text_col, 1)
+        return hero
+
+    def _build_version_panel(self, local_version: str, latest_version: str) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("UpdateVersionPanel")
+        panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        grid = QGridLayout(panel)
+        grid.setContentsMargins(16, 14, 16, 14)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(8)
+
+        self.local_version_label = self._make_version_label(self._tr("当前版本"))
+        self.local_version_value = self._make_version_value(local_version or "-")
+        self.remote_version_label = self._make_version_label(self._tr("Release 版本"))
+        remote_version = latest_version or (
+            f"{self._tr('检测中')}…" if self._status == "checking" else "-"
+        )
+        self.remote_version_value = self._make_version_value(remote_version)
+        self.remote_version_value.setProperty("tone", self._status_tone())
+        arrow = QLabel("→")
+        arrow.setObjectName("UpdateVersionArrow")
+        arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        grid.addWidget(self.local_version_label, 0, 0)
+        grid.addWidget(self.local_version_value, 1, 0)
+        grid.addWidget(arrow, 1, 1)
+        grid.addWidget(self.remote_version_label, 0, 2)
+        grid.addWidget(self.remote_version_value, 1, 2)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(2, 1)
+        return panel
+
+    def _build_candidate_selector(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("UpdateCandidatePanel")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(14, 12, 14, 12)
+        panel_layout.setSpacing(8)
+
+        label = QLabel(self._tr("选择要安装的修订"))
+        label.setObjectName("UpdateDetailTitle")
+        panel_layout.addWidget(label)
+
+        self.version_combo = ThemedComboBox()
+        self.version_combo.setObjectName("UpdateVersionCombo")
+        self.version_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        for option in self._candidate_options:
+            self.version_combo.addItem(self._candidate_label(option), option["candidate_id"])
+        self.version_combo.currentIndexChanged.connect(self._on_candidate_changed)
+        panel_layout.addWidget(self.version_combo)
+        return panel
+
+    def _build_detail_card(self, details: str) -> QWidget:
+        card = QFrame()
+        card.setObjectName("UpdateDetailCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(14, 12, 14, 12)
+        card_layout.setSpacing(7)
+
+        detail_title = QLabel(self._detail_title())
+        detail_title.setObjectName("UpdateDetailTitle")
+        card_layout.addWidget(detail_title)
+
+        self.details_browser = _ReleaseNotesBrowser()
+        self.details_browser.setObjectName("UpdateMarkdownView")
+        self.details_browser.setFrameShape(QFrame.Shape.NoFrame)
+        self.details_browser.setOpenExternalLinks(False)
+        self.details_browser.setOpenLinks(False)
+        self.details_browser.anchorClicked.connect(self._activate_release_note_link)
+        self.details_browser.setLineWrapMode(QTextBrowser.LineWrapMode.WidgetWidth)
+        self.details_browser.setMinimumHeight(220)
+        self.details_browser.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._render_detail_markdown(details)
+        card_layout.addWidget(self.details_browser, 1)
+
+        if self._release_url:
+            link_text = self._tr("打开 GitHub Release 页面")
+            self.release_link = QLabel(
+                f'<a href="{escape(self._release_url, quote=True)}">{escape(link_text)}</a>'
+            )
+            self.release_link.setObjectName("UpdateReleaseLink")
+            self.release_link.setOpenExternalLinks(False)
+            self.release_link.setTextFormat(Qt.TextFormat.RichText)
+            self.release_link.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+            self.release_link.linkActivated.connect(self._activate_release_note_link)
+            self._sync_release_link()
+            card_layout.addWidget(self.release_link)
+        return card
+
+    def _build_button_row(self, primary_text: str, secondary_text: str, skip_text: str) -> QHBoxLayout:
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 2, 0, 0)
+        button_row.addStretch(1)
+
+        if skip_text:
+            self.skip_button = QPushButton(self._tr(skip_text))
+            self.skip_button.setObjectName("DialogNeutralButton")
+            self.skip_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.skip_button.clicked.connect(lambda: self.done(self.SKIP_CODE))
+            button_row.addWidget(self.skip_button)
+        else:
+            self.skip_button = None
+
+        if secondary_text:
+            self.secondary_button = QPushButton(self._tr(secondary_text))
+            self.secondary_button.setObjectName("DialogNeutralButton")
+            self.secondary_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.secondary_button.clicked.connect(self.reject)
+            button_row.addWidget(self.secondary_button)
+        else:
+            self.secondary_button = None
+
+        self.primary_button = QPushButton(self._tr(primary_text))
+        self.primary_button.setObjectName("DialogPrimaryButton")
+        self.primary_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.primary_button.clicked.connect(self.accept)
+        self.primary_button.setDefault(True)
+        button_row.addWidget(self.primary_button)
+        return button_row
+
+    def apply_chrome_theme(self, is_dark: bool) -> None:
+        super().apply_chrome_theme(is_dark)
+        if hasattr(self, "status_icon"):
+            self.status_icon.set_status(self._status, self._colors)
+        if self.details_browser is not None:
+            self._render_detail_markdown(self._rendered_details)
+
+    def selected_update_version(self) -> str:
+        return str(self._selected_version or "")
+
+    def selected_update_candidate_id(self) -> str:
+        """返回签名候选的稳定 tag，避免同一版本的多个修订发生歧义。"""
+
+        return str(self._selected_candidate_id or "")
+
+    def _on_candidate_changed(self, index: int) -> None:
+        if index < 0 or index >= len(self._candidate_options):
+            return
+        option = self._candidate_options[index]
+        self._selected_version = option["version"]
+        self._selected_candidate_id = option["candidate_id"]
+        self._release_url = option["release_url"]
+        self.remote_version_value.setText(option["tag"] or self._display_version(option["version"]))
+        if self.details_browser is not None:
+            self._render_detail_markdown(option["notes"] or self._initial_details)
+        self._sync_release_link()
+
+    def _activate_release_note_link(self, link: QUrl | str) -> None:
+        url = link if isinstance(link, QUrl) else QUrl(str(link or ""))
+        if (
+            self.details_browser is not None
+            and url.isRelative()
+            and not url.path()
+            and bool(url.fragment())
+        ):
+            self.details_browser.scrollToAnchor(url.fragment())
+            return
+        if self._is_allowed_project_release_url(url):
+            QDesktopServices.openUrl(url)
+
+    def _sync_release_link(self) -> None:
+        if self.release_link is None:
+            return
+        url = QUrl(self._release_url)
+        allowed = self._is_allowed_project_release_url(url)
+        self.release_link.setVisible(allowed)
+        if not allowed:
+            self.release_link.clear()
+            return
+        link_text = self._tr("打开 GitHub Release 页面")
+        self.release_link.setText(
+            f'<a href="{escape(self._release_url, quote=True)}">'
+            f"{escape(link_text)}</a>"
+        )
+
+    @staticmethod
+    def _is_allowed_project_release_url(url: QUrl) -> bool:
+        if (
+            not url.isValid()
+            or url.isRelative()
+            or not url.scheme().isascii()
+            or url.scheme().lower() != "https"
+            or not url.host(_FULLY_ENCODED).isascii()
+            or url.host(_FULLY_ENCODED).lower() != _PROJECT_RELEASE_HOST
+            or url.port(-1) not in {-1, 443}
+        ):
+            return False
+
+        authority = url.authority(_FULLY_ENCODED)
+        if (
+            not authority.isascii()
+            or "@" in authority
+            or authority.lower() not in {_PROJECT_RELEASE_HOST, f"{_PROJECT_RELEASE_HOST}:443"}
+        ):
+            return False
+
+        encoded_path = url.path(_FULLY_ENCODED)
+        if not encoded_path.startswith("/"):
+            return False
+        encoded_segments = encoded_path.split("/")
+        if len(encoded_segments) < 3 or any(
+            not segment for segment in encoded_segments[1:-1]
+        ):
+            return False
+        decoded_segments = [
+            _fully_decode_release_path_segment(segment)
+            for segment in encoded_segments[1:]
+        ]
+        if any(segment is None for segment in decoded_segments):
+            return False
+
+        owner, repository = decoded_segments[:2]
+        return (
+            bool(owner)
+            and bool(repository)
+            and owner.isascii()
+            and repository.isascii()
+            and owner.lower() == _PROJECT_RELEASE_OWNER
+            and repository.lower() == _PROJECT_RELEASE_REPOSITORY
+        )
+
+    def _render_detail_markdown(self, details: str) -> None:
+        self._rendered_details = str(details or "")
+        if self.details_browser is None:
+            return
+        colors = self._colors
+        self.details_browser.document().setDefaultStyleSheet(
+            f"""
+            body {{ color: {colors['text']}; }}
+            h1, h2, h3, h4 {{ color: {colors['text']}; margin: 8px 0 5px 0; }}
+            p {{ color: {colors['text']}; margin: 4px 0; }}
+            a {{ color: {colors['accent']}; text-decoration: none; }}
+            code, pre {{ color: {colors['text']}; background-color: {colors['panel']}; }}
+            table {{ border-collapse: collapse; margin: 6px 0; }}
+            th, td {{ border: 1px solid {colors['border']}; padding: 5px 7px; }}
+            """
+        )
+        self.details_browser.setMarkdown(self._detail_text(self._rendered_details))
+
+    @staticmethod
+    def _display_version(version: str) -> str:
+        return format_version_label(version, fallback="-")
+
+    def _candidate_label(self, option: dict[str, Any]) -> str:
+        version = self._display_version(option["version"])
+        revision = int(option.get("revision") or 0)
+        revision_label = (
+            self._tr("初始版")
+            if revision == 0
+            else f"{self._tr('修订')} {revision}"
+        )
+        name = option["name"] or option["tag"]
+        asset = option["asset"]
+        parts = [f"{version} {revision_label}"]
+        if name and name not in {version, option["version"], option["tag"]}:
+            parts.append(name)
+        if asset:
+            parts.append(asset)
+        return "  |  ".join(parts)
+
+    @staticmethod
+    def _make_version_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("UpdateVersionLabel")
+        return label
+
+    @staticmethod
+    def _make_version_value(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("UpdateVersionValue")
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        return label
+
+    def _status_tone(self) -> str:
+        if self._status == "checking":
+            return "accent"
+        if self._status == "current":
+            return "success"
+        if self._status == "available":
+            return "accent"
+        if self._status == "local_newer":
+            return "warning"
+        if self._status == "error":
+            return "danger"
+        return "muted"
+
+    def _tr(self, text: str) -> str:
+        return tr(text, self._language)
+
+    def _status_badge_text(self) -> str:
+        return self._tr({
+            "checking": "检测中",
+            "current": "已是最新",
+            "available": "发现更新",
+            "local_newer": "本地构建",
+            "error": "检测失败",
+        }.get(self._status, "提示"))
+
+    def _detail_title(self) -> str:
+        return self._tr({
+            "current": "检查结果",
+            "available": "更新说明",
+            "local_newer": "为什么会这样",
+            "error": "错误详情",
+        }.get(self._status, "补充信息"))
+
+    def _detail_text(self, details: str) -> str:
+        text = str(details or "").strip()
+        if text:
+            return self._tr(text)
+        if self._status == "available":
+            return self._tr("更新前建议关闭正在运行的采集任务。安装包会先完成更新清单签名、大小和 SHA-256 校验。")
+        if self._status == "current":
+            return self._tr("本地版本与 GitHub 最新 Release 一致，无需更新。")
+        if self._status == "local_newer":
+            return self._tr("通常表示你正在使用本地构建或预发布构建，无需更新。")
+        return self._tr("暂无更多信息。")
+
+
+class UpdateDownloadDialog(ChromedDialog):
+    """承载已验证更新包下载与安装交接进度的模态界面。"""
+
+    cancel_requested = pyqtSignal()
+    retry_requested = pyqtSignal()
+    install_requested = pyqtSignal()
+    view_log_requested = pyqtSignal()
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        version: str,
+        asset_name: str = "",
+        release_url: str = "",
+        language: str = "zh-CN",
+    ) -> None:
+        self._language = normalize_language(language)
+        self._terminal_state = False
+        self._installing = False
+        self._release_url = str(release_url or "").strip()
+        super().__init__(
+            parent,
+            title=self._tr("下载更新"),
+            object_name="UpdateDownloadDialog",
+            body_margins=(24, 22, 24, 20),
+            body_spacing=16,
+        )
+        self.setMinimumWidth(620)
+        self.setMaximumWidth(720)
+
+        layout = self.content_layout
+        layout.addWidget(self._build_header(version, asset_name))
+        layout.addWidget(self._build_progress_panel())
+        layout.addLayout(self._build_button_row())
+
+    def _build_header(self, version: str, asset_name: str) -> QWidget:
+        hero = QFrame()
+        hero.setObjectName("UpdateHero")
+        hero_layout = QHBoxLayout(hero)
+        hero_layout.setContentsMargins(0, 0, 0, 0)
+        hero_layout.setSpacing(14)
+
+        self.status_icon = UpdateStatusIcon(status="available", colors=self._colors, parent=hero)
+        hero_layout.addWidget(self.status_icon, 0, Qt.AlignmentFlag.AlignTop)
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(8)
+        title_label = QLabel(self._tr("正在下载更新"))
+        title_label.setObjectName("DialogTitle")
+        text_col.addWidget(title_label)
+        message = self._tr("正在下载并校验版本 {version}。").format(version=version or "-")
+        if asset_name:
+            message = f"{message}\n{asset_name}"
+        message_label = QLabel(message)
+        message_label.setObjectName("DialogBody")
+        message_label.setWordWrap(True)
+        message_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        text_col.addWidget(message_label)
+        hero_layout.addLayout(text_col, 1)
+        return hero
+
+    def _build_progress_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("UpdateDetailCard")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(14, 12, 14, 12)
+        panel_layout.setSpacing(10)
+
+        self.state_label = QLabel(self._tr("准备下载..."))
+        self.state_label.setObjectName("UpdateDetailTitle")
+        panel_layout.addWidget(self.state_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setObjectName("UpdateDownloadProgress")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        panel_layout.addWidget(self.progress_bar)
+
+        self.detail_label = QLabel(self._tr("安装包会先完成更新清单签名、大小和 SHA-256 校验。"))
+        self.detail_label.setObjectName("DialogStatus")
+        self.detail_label.setWordWrap(True)
+        self.detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        panel_layout.addWidget(self.detail_label)
+        return panel
+
+    def _build_button_row(self) -> QHBoxLayout:
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 2, 0, 0)
+
+        self.view_log_button = QPushButton(self._tr("查看日志"))
+        self.view_log_button.setObjectName("DialogNeutralButton")
+        self.view_log_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.view_log_button.clicked.connect(self.view_log_requested.emit)
+        button_row.addWidget(self.view_log_button)
+
+        button_row.addStretch(1)
+
+        self.retry_button = QPushButton(self._tr("重试"))
+        self.retry_button.setObjectName("DialogNeutralButton")
+        self.retry_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.retry_button.clicked.connect(self.retry_requested.emit)
+        self.retry_button.hide()
+        button_row.addWidget(self.retry_button)
+
+        self.cancel_button = QPushButton(self._tr("取消下载"))
+        self.cancel_button.setObjectName("DialogNeutralButton")
+        self.cancel_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cancel_button.clicked.connect(self.cancel_requested.emit)
+        button_row.addWidget(self.cancel_button)
+
+        self.install_button = QPushButton(self._tr("安装并重启"))
+        self.install_button.setObjectName("DialogPrimaryButton")
+        self.install_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.install_button.clicked.connect(self._request_install)
+        self.install_button.hide()
+        button_row.addWidget(self.install_button)
+        return button_row
+
+    def _request_install(self) -> None:
+        if self._installing or not self.install_button.isEnabled():
+            return
+        self.set_installing()
+        self.install_requested.emit()
+
+    def set_installing(self) -> None:
+        self._installing = True
+        self.install_button.setDefault(False)
+        self.install_button.setEnabled(False)
+
+    def set_progress(self, progress: dict) -> None:
+        percent = max(0, min(100, int(float(progress.get("percent") or 0))))
+        self.progress_bar.setValue(percent)
+        downloaded = int(progress.get("bytesDownloaded") or 0)
+        total = int(progress.get("totalBytes") or 0)
+        self.state_label.setText(self._tr("正在下载更新"))
+        if total > 0:
+            self.detail_label.setText(
+                self._tr("已下载 {downloaded} / {total} MB").format(
+                    downloaded=f"{downloaded / 1024 / 1024:.1f}",
+                    total=f"{total / 1024 / 1024:.1f}",
+                )
+            )
+
+    def set_error(self, message: str) -> None:
+        self._terminal_state = True
+        self._installing = False
+        self.status_icon.set_status("error", self._colors)
+        self.state_label.setText(self._tr("更新下载失败"))
+        self.detail_label.setText(self._tr(str(message or "未知错误")))
+        self.cancel_button.hide()
+        self.install_button.hide()
+        self.retry_button.show()
+
+    def set_cancelling(self) -> None:
+        self._terminal_state = True
+        self._installing = False
+        self.state_label.setText(self._tr("正在取消下载"))
+        self.detail_label.setText(self._tr("正在等待下载线程停止，请稍候。"))
+        self.cancel_button.hide()
+        self.retry_button.hide()
+        self.install_button.hide()
+
+    def set_cancelled(self) -> None:
+        self.set_error(self._tr("已取消下载。"))
+
+    def set_ready(self, installer_path: str) -> None:
+        self._terminal_state = True
+        self._installing = False
+        self.status_icon.set_status("current", self._colors)
+        self.progress_bar.setValue(100)
+        self.state_label.setText(self._tr("更新已准备好"))
+        self.detail_label.setText(self._tr("安装包已下载并通过校验：{path}").format(path=installer_path))
+        self.cancel_button.hide()
+        self.retry_button.hide()
+        self.install_button.show()
+        self.install_button.setEnabled(True)
+        self.install_button.setDefault(True)
+
+    def reject(self) -> None:
+        if not self._terminal_state:
+            self.cancel_requested.emit()
+        super().reject()
+
+    def _tr(self, text: str) -> str:
+        return tr(text, self._language)

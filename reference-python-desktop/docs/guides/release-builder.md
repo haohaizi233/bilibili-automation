@@ -1,0 +1,236 @@
+# 发布构建面板维护指南
+
+本文档说明 Universal Crawler Pro 的唯一发布入口、版本模式、签名材料、
+信任锚轮换和远端发布约束。面向维护者，不替代用户安装说明。
+
+## 入口
+
+在项目根目录执行：
+
+```powershell
+python packaging/build_release.py
+```
+
+无参数运行会打开使用项目标题栏、主题令牌和专用图标的 Qt 构建面板。面板通过
+`QProcess` 启动同一脚本的无界面子进程，进度来自结构化 JSONL 事件，不根据日志文本
+猜测。
+
+自动化、CI 或兼容旧脚本时使用无界面入口：
+
+```powershell
+python packaging/build_release.py --headless --build-only --version 3.6.21
+```
+
+只验证计划、不写版本、不构建、不签名、不操作 Git/GitHub：
+
+```powershell
+python packaging/build_release.py --headless --dry-run --version 3.6.21 --build-only
+```
+
+`--build-only` 只适合本地构建，产物不具备热更新发布资格。
+
+## 版本模式
+
+面板先读取 `shared/version.py` 的本地产品版本，再有界枚举远端 Releases 并解析完整发布身份，
+最后投影为三个面向维护者的稳定意图：
+
+| 面板意图 | 可用条件 | 首次进入时的安全默认值 |
+| --- | --- | --- |
+| 本地构建 | 任意有效版本；远端不可用时也可用 | 构建 portable、installer 并运行冒烟测试；禁止签名和全部远端写入 |
+| 同版本新修订 | 目标版本等于远端版本 | 自动选择下一修订号，推送当前干净 HEAD，创建独立 tag/Release，签名并回读新资产；不改产品版本 |
+| 高版本发布 | 目标版本高于远端版本 | 执行完整版本提交、推送、签名、tag、Release、上传与远端回读链路 |
+
+目标版本低于远端并不代表降级发布。它始终只能进入本地构建，防止误覆盖已发布版本。远端不可用时，
+面板保留本地构建能力并禁用两种远端意图；远端刷新期间保留上一次已确认的模式，避免控件来回跳变。
+用户在某个模式中调整过选项后，切换模式再返回会恢复该模式自己的状态，不会重复套用默认值。
+
+## 面板布局契约
+
+- 面板使用左侧配置、右侧执行日志的双栏工作台，不设置外层滚动区；最低验收窗口为 `980 × 680`。
+- 左侧五张配置卡与右侧执行卡共享底边，卡片通过布局 stretch 吸收剩余高度，不使用绝对坐标补齐。
+- 模式按钮和紧凑输入框分别约束“内容盒高度”和控件总高度，避免全局 QSS 的 `min-height`、边框与
+  padding 叠加后形成 `minimumHeight > maximumHeight`，从而裁掉文字。
+- 发布复选项按每个控件的实际 `sizeHint()` 计算可用列数。窗口变窄时先换行，不缩小字体，也不截断标签。
+- 上传代理复用配置中心的 `ThemedComboBox` 契约；自定义端点仅在选择自定义代理时于同一行展开。
+- 私钥输入框默认显示仓库外规范路径 `~/.ucrawl/release-secrets/update_manifest_ed25519_private.pem`，
+  并从路径开头展示；维护者通常无需手动寻找私钥目录。
+
+### 窗口 chrome 契约
+
+发布构建器没有自己的最大化状态机。它与主 GUI、测试入口和所有应用弹窗一样，只通过
+`FramelessWindowChromeController.bind_title_bar_controls()` 接收标题栏操作。不得在面板中
+重新定义 `_toggle_maximized()`，不得直接连接 `maximize_restore_requested`，也不得使用
+`isMaximized()` 决定最大化/还原图标。Windows 下图标真值来自 `IsZoomed(hwnd)`，动作由共享
+控制器转为 `ShowWindow(SW_MAXIMIZE/SW_RESTORE)`。
+
+新增任何顶层窗口都必须遵守
+[`Windows 自绘标题栏与原生窗口行为`](../engineering/windows-native-chrome-hit-test.md)；
+`tests/architecture/test_window_chrome_contract.py` 会在 CI 中阻止局部实现和裸 `QDialog()`。
+
+## 本地调试边界
+
+本地调试和本地重构建：
+
+- 继承源码中已经提交的生产公钥；
+- 不生成本地 manifest 密钥；
+- 不写入 `app/config/update_trust.py`；
+- 不生成或上传 `latest.json`、`latest.json.sig`；
+- 不创建 tag、Release，也不推送分支；
+- 不把测试公钥或临时公钥打进 portable/installer。
+
+这些限制由模式验证器和 runner 双重执行，不能只靠面板控件禁用。
+
+## 新版本发布依赖
+
+创建新 Release 时，以下选项构成完整链路：
+
+1. 应用版本变更；
+2. 提交版本与公开信任配置；
+3. 推送 `main`；
+4. 为本次完整身份创建唯一 tag；初始版为 `v<version>`，后续修订为 `v<version>-rN`；
+5. 构建 portable 与 installer；
+6. 使用仓库外私钥签署更新清单；
+7. 执行 smoke tests；
+8. 创建当前 tag 对应的独立 GitHub Release；
+9. 上传 installer、`latest.json`、`latest.json.sig`；
+10. 从远端回读并校验资产。
+
+缺少任一强制依赖时，预检会失败关闭。安装包、清单和签名必须来自同一个已验证
+`sourceCommit` 快照。
+
+## 同版本新修订
+
+同版本新修订只在目标产品版本等于远端版本且维护者显式选择时可用。面板会从有效
+Release 标签中计算 `max(revision) + 1`，并在执行前显示即将创建的完整目标 tag。例如，
+`v3.6.21`、`v3.6.21-r1`、`v3.6.21-r2` 已存在时，下一次目标固定为
+`v3.6.21-r3`。
+
+- 修订号不会写回 `shared/version.py`，产品版本仍是唯一 SemVer 事实源；
+- 当前工作树必须干净且源码已提交，流水线先把当前 HEAD 推到 `main`，再创建新修订 tag；
+- 每个修订拥有独立 Git tag、GitHub Release、安装包、`latest.json` 和签名；
+- 已存在的 tag 不允许移动，已存在的 Release 元数据不自动改写；
+- 同名远端资产只有大小和 SHA-256 都一致时才按幂等重试跳过；摘要缺失或不一致一律失败；
+- 发布器不会调用 `gh release upload --clobber`，修复内容变化时必须发布下一修订；
+- 面板在远端写入开始前显示版本、修订、tag、仓库、代理与资产摘要。
+
+旧客户端只查询单个最新 SemVer Release，无法发现同 SemVer 的后续修订。因此，首次启用
+本协议时必须先发布一个更高产品版本，让用户升级到具备修订枚举能力的客户端；从该版本
+开始，后续 `-rN` 修订才可被完整发现和选择。更新始终需要用户确认，清单中的旧
+`mandatory` 字段不会触发强制安装。
+
+## 密钥与信任锚
+
+默认签名材料目录：
+
+```text
+~/.ucrawl/release-secrets
+```
+
+可通过 `UCRAWL_RELEASE_SECRETS_DIR` 指向其他仓库外目录。私钥路径也可以由受控环境变量
+引用，但私钥内容不得进入参数、请求 JSON、事件、日志、构建目录或 Git。
+
+普通正式发布复用已有私钥，不修改生产信任锚。若对应 public PEM 缺失或与私钥不匹配，
+工具会从私钥重新导出并原子修复仓库外 public PEM。
+
+轮换信任锚必须显式勾选，并且只能用于高于远端版本的新版本发布。轮换强制要求：
+
+- 生成新的 manifest key；
+- 应用并提交版本变更；
+- 把新公钥注入 `app/config/update_trust.py`；
+- 推送 `main` 并创建尚不存在的新 tag；
+- 从包含新信任锚的同一提交快照重建 installer。
+
+私钥、公钥和信任配置作为一个事务写入。在验证版本提交形成之前，版本应用、提交、
+取消或中断失败都会恢复轮换前内容；验证提交形成后，后续推送或构建失败保留已经提交
+的源身份，避免把工作树反向改脏。日志只显示文件名和公钥 SHA-256 fingerprint，不显示
+私钥目录或内容。
+
+公开 PEM 仅可作为独立、可选的 GitHub Release 审计资产上传，不能复制进 portable 或
+installer。运行时信任来源始终是构建快照中的 `UPDATE_PUBLIC_KEY_PEM`。
+
+## 代理
+
+代理选项复用项目配置中心的代理契约：
+
+- 系统代理：保留当前进程环境；
+- 直连：从子进程环境移除大小写两套 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`；
+- Clash、Clash Verge、v2rayN 等项目预设：把规范化端点写入上述三组变量；
+- 自定义：接受明确的 HTTP/HTTPS/SOCKS 端点；
+- `env:NAME`：只在子进程内解析受控环境变量，避免把认证信息写入请求文件。
+
+面板只显示代理标签。带认证的 URL、Cookie、Authorization 和 token 会在事件流与持久
+日志进入 UI 前脱敏。
+
+## 日志、取消与恢复
+
+面板日志位于：
+
+```text
+dist/release-logs/
+```
+
+每次执行使用时间戳和随机后缀生成独立审计日志。日志区域支持复制、导出、清空视图和
+打开目录；清空视图不会删除持久日志。
+
+取消先请求子进程协作退出，超时后终止进程；Windows 上会使用 `taskkill /T /F` 清理进程
+树并等待确认。关闭仍在运行的面板会先进入取消流程，只有子进程、远端查询线程和日志
+写入生命周期收束后才关闭窗口。
+
+日志写入失败不会把已经取得的发布结果改写成失败，但 UI 会明确提示审计日志可能不完整。
+协议事件缺失、畸形或终态与进程退出码不一致时，发布按失败处理。
+
+## 版本唯一事实源
+
+项目版本唯一事实源是：
+
+```text
+shared/version.py
+```
+
+`pyproject.toml` 通过动态元数据读取该值。版本事务只允许同步以下当前版本投影：
+
+- `README.md`
+- `README_EN.md`
+- `docs/README.md`
+- `cli/skill/SKILL.md`
+
+历史 Release 文档不在投影列表中，不会因新版本构建被批量改写。版本更新先生成完整计划，
+再使用临时文件和 `os.replace` 原子提交；中途失败会回滚已经替换的文件。
+
+## 远端资产验收
+
+正式发布至少要求并回读校验：
+
+- `UniversalCrawlerPro_Setup_<version>.exe`
+- `latest.json`
+- `latest.json.sig`
+
+可选上传：
+
+- `update_manifest_ed25519_public.pem`
+
+回读会复核资产名称、大小、SHA-256、下载 URL、平台、版本、`sourceCommit` 和 Ed25519
+签名。公钥资产只用于独立审计，不替代客户端内置信任锚。
+
+## 发布前检查
+
+```powershell
+python -m pytest tests/release/packaging tests/release/updater -q
+python -m ruff check packaging/build_release.py packaging/release_tool scripts/update_bootstrap.py
+python -m compileall packaging/release_tool packaging/build_release.py
+python -m scripts.update_bootstrap scan-secrets
+```
+
+最后确认工作树只包含预期公开文件，且私钥、token、代理密码、请求临时文件均未被 Git
+跟踪。
+
+### 2026-07-19 验收记录
+
+- Release 打包与更新器分区：`764 passed in 97.04s`。
+- Headless 规划烟测：
+  `python packaging/build_release.py --headless --dry-run --version 3.6.21 --build-only`，
+  返回码为 `0`，且不会修改统一版本源。
+- 私钥扫描区分文档/测试中的短合成占位文本与真实 PEM 载荷；真实私钥即使落入测试目录也会
+  阻断发布。
+- 正式发布仍必须完成 installer、`latest.json`、`latest.json.sig` 三项远端回读，不能用
+  dry-run 或本地构建结果替代。

@@ -1,0 +1,66 @@
+﻿# 架构指南
+
+Universal Crawler Pro 是一个多平台视频、图文采集与下载系统，支持 GUI、CLI、SDK 和 Web API 四种入口。当前架构目标是：采集、解析、队列、下载、日志、前端刷新各司其职，通过统一状态适配层对 GUI 和 WebUI 暴露同一套页面语义。
+
+## 当前分层
+
+| 层级 | 主要模块 | 职责 |
+| --- | --- | --- |
+| 入口层 | `main.py`、`entry.gui_entry`、`entry.web_entry`、`entry.cli_entry`、`entry.test_entry`、PyQt 主窗口 | 启动应用、接收用户操作、连接控制器 |
+| 控制层 | `app/controllers/application_controller.py`、各 mixin | 协调任务启动、停止、删除、重试和配置变更 |
+| 服务层 | `app/services/frontend_state_service.py`、调试、文件、Windows 文件关联服务 | 提供 GUI/WebUI 统一状态、动作适配、文件操作和诊断能力 |
+| 核心层 | `app/core/download_manager.py`、`app/core/events.py`、`app/core/state.py` | 管理任务状态、事件广播、下载并发和生命周期 |
+| 平台层 | 各平台 spider / downloader / parser | 平台输入识别、资源解析、下载实现 |
+| 前端层 | `app/ui`、`app/web/static` | 统一 7 页结构、局部刷新和用户交互 |
+
+## GUI / WebUI 统一页面
+
+GUI 和 WebUI 共享 7 个业务页面：下载队列、正在下载、已完成、失败列表、日志中心、配置中心、工具箱。页面字段、状态值和操作语义应通过 `FrontendStateService` 保持一致。
+
+前端不得直接调用 Spider、Downloader、Parser 或 TaskBuilder。页面只读取 `queue_items`、`active_downloads`、`completed_items`、`failed_items`、`log_items`、`settings_snapshot`、`toolbox_items` 和 `app_status`，动作通过控制器或适配服务转发。
+
+开发态 Web UI 入口已经收敛到 `python -m entry.web_entry`，打包态通过 `CrawlerWebPortal.exe` 直启；历史单文件 Web 入口只应出现在旧复盘或历史说明中。
+
+## 执行身份与工具运行时
+
+GUI、Web、CLI 和 SDK 调用工具时都必须消费宿主创建的 `ExecutionProfile`。该对象是执行能力的唯一事实源，包含宿主表面、`owner_id`、工具权限、网络/代理/凭据策略和 `approved_roots`；前端 payload、插件 manifest 与普通配置都不能构造、替换或扩大这些字段。子调用只能通过 `restrict()` 单调收窄权限和目录，不能把父级未批准的能力重新打开。
+
+工具运行顺序固定为：读取注册项和 provenance、计算 manifest requirements 与宿主 grant 的交集、验证参数与路径、执行容量准入、创建 owner-scoped 运行记录，再进入后台执行。路径型工具在 `approved_roots` 为空时失败关闭；真实路径解析后必须仍位于至少一个批准根的内部。打开工具产物时要先校验整组私有结果路径属于当前 owner 和当前批准根，再允许用户从其中选择，不能只验证最后被点击的单个字符串。
+
+`ToolRunnerService` 是运行记录、取消、等待和终态历史的所有者。GUI 进程、Web 会话、CLI 命令和 SDK 实例各自使用稳定且隔离的 owner；一个 owner 不能读取、取消或打开另一个 owner 的运行结果。退出时先停止接收新任务，再有界排空已接收的终态历史；cleanup、日志或持久化失败可以附加诊断，但不得覆盖原始执行结果或控制流异常。
+
+## 事件与刷新
+
+高频下载进度和日志不能直接驱动整页重绘。当前工程使用前端事件聚合和局部快照思路：
+
+- 关键事件立即推送，例如完成、失败、删除、停止。
+- 高频事件合并推送，例如进度、速度和日志追加。
+- 当前可见页面刷新内容区；不可见页面只更新侧栏角标和底部状态栏。
+- GUI 表格优先按 id 更新行；WebUI 使用 keyed patch 和 reducer 合并状态。
+- GUI 全量前端快照走 `FrontendSnapshotWorker`，用户动作走 `FrontendActionWorker`，日志中心走 `LogQueryWorker` / `LogDetailWorker`，完成/失败/队列分页走 `ListPageWorker`。这些 worker 的共同目标是把查询、格式化和分页从 UI 线程移开。
+- WebUI 的 `/api/frontend/state` 和 `/api/frontend/delta` 必须与 GUI 使用同一份 `FrontendStateService` 语义；新增字段不能只改静态 JS，也不能只改 PyQt 页面。
+- 主题切换、语言切换、日志追加和下载进度都属于高频刷新风险区。主题切换默认不触发完整前端 snapshot，避免按钮、设置落盘、列表重绘和 shell repaint 互相抢主线程。
+
+细化执行规则见 [前端刷新与并发控制工程实践](../engineering/frontend-refresh-and-concurrency.md)。
+
+## Shell 与主题边界
+
+GUI 当前使用自绘标题栏和统一 shell：标题栏、TopBar、Sidebar、PageStack、StatusBar 共同组成主界面。主题切换必须在 UI 构建完成后执行，并且不能冻结 `window_root`。如果 shell 出现黑屏、只剩媒体预览或按钮图标先变页面滞后的症状，优先检查 shell chrome 可见性、`updatesEnabled`、主题 busy 队列和前端 snapshot 是否误入热路径。
+
+相关事故复盘见 [GUI 主题切换黑屏事故复盘](../fixes/2026-07-gui-theme-black-shell.md)。
+
+## 下载流水线
+
+长期原则是生产者消费者模型：解析只负责产出候选资源，队列只负责排序和状态，下载器只负责下载，日志只记录事实。并发数表示“最大同时下载任务数”，不是一次任务走完才启动下一个。图片资源可以有独立并发上限，但也必须受工程化限流保护，避免 UI 和网络洪峰。
+
+下载副作用遵循“先记账、再执行”：dispatcher 在创建 worker 前把精确目录提交到 `DownloadRecoveryStore`；成功立即销账，失败和异常退出留下的目录在下一次启动清理尝试后销账。启动清理运行在后台维护线程，普通遗留目录最多扫描两层，不能把用户配置根当作可无界递归的内部工作区。
+
+## 配置与持久化
+
+配置中心负责展示和修改可持久化设置。带“推荐”的选项必须与默认配置一致；平台数量限制需要按平台语义显示，例如 Bilibili 使用页数，小红书使用笔记数，视频平台使用视频数。
+
+设置控件、下拉框、主题语言和国际化规则见 [设置、下拉框与国际化契约](../engineering/settings-ui-contract.md)。
+
+## 兼容边界
+
+重构前端和适配层时不得破坏 CLI、SDK、Web API、测试体系和 PyInstaller 打包。新增字段应保持非破坏性；删除字段前必须同步 GUI/WebUI、测试和文档。

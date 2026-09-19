@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebView Automation Test</title>
+    <style>
+        body { font-family: sans-serif; padding: 16px; }
+        input, button { font-size: 16px; margin: 8px 0; padding: 8px; }
+        #result, #async-result { margin-top: 12px; padding: 8px; background: #eef; }
+        section { border: 1px solid #ccc; padding: 8px; margin: 12px 0; }
+        .video-item, .comment-item { display: block; margin: 4px 0; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div id="page-type" data-page="target">mock-site</div>
+    <div id="session-status" data-status="ok">session valid</div>
+    <div id="rate-limit-banner" data-active="false" class="hidden">RATE_LIMITED</div>
+    <div id="account-restricted-banner" data-active="false" class="hidden">ACCOUNT_RESTRICTED</div>
+
+    <h1>Automation Test Page</h1>
+    <p>Local asset used to verify fill / click / wait / getText and mock workflow.</p>
+
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" placeholder="type here" />
+
+    <button id="submit" type="button">Submit</button>
+    <div id="result"></div>
+
+    <button id="asyncButton" type="button">Create Async Element</button>
+
+    <section id="target-profile">
+        <h2>Target 20002</h2>
+        <button id="open-target" type="button">Open Target</button>
+        <div id="video-list">
+            <button class="video-item" data-bvid="BV1mock01" type="button">Video One</button>
+            <button class="video-item" data-bvid="BV1mock02" type="button">Video Two</button>
+        </div>
+    </section>
+
+    <section id="comment-list">
+        <h2>Comments</h2>
+        <div class="comment-item root" data-comment-id="c1" data-uid="30001">
+            <button class="user-link" type="button">user-30001</button>
+            root comment one
+        </div>
+        <div class="comment-item root" data-comment-id="c2" data-uid="30002">
+            <button class="user-link" type="button">user-30002</button>
+            root comment two
+        </div>
+        <div class="comment-item" data-comment-id="c1-reply" data-uid="30003">
+            reply (not root)
+        </div>
+        <button id="open-user" type="button">Open User</button>
+        <button id="back-to-comments" type="button">Back to comments</button>
+    </section>
+
+    <section id="user-profile">
+        <h2>User Profile</h2>
+        <div id="relationship" data-relationship="NOT_FOLLOWING">NOT_FOLLOWING</div>
+        <button id="mock-action-btn" type="button">Mock Action</button>
+    </section>
+
+    <script>
+        document.getElementById("submit").addEventListener("click", function () {
+            var value = document.getElementById("username").value;
+            document.getElementById("result").textContent = "Hello, " + value;
+            console.log("submit clicked, username=" + value);
+        });
+
+        document.getElementById("asyncButton").addEventListener("click", function () {
+            console.warn("async button clicked, inserting #async-result in 1s");
+            setTimeout(function () {
+                var existing = document.getElementById("async-result");
+                if (existing) {
+                    existing.textContent = "Ready";
+                    return;
+                }
+                var el = document.createElement("div");
+                el.id = "async-result";
+                el.textContent = "Ready";
+                document.body.appendChild(el);
+                console.log("async-result inserted");
+            }, 1000);
+        });
+
+        document.getElementById("open-target").addEventListener("click", function () {
+            document.getElementById("page-type").setAttribute("data-page", "video-list");
+        });
+        document.querySelectorAll(".video-item").forEach(function (btn) {
+            btn.addEventListener("click", function () {
+                document.getElementById("page-type").setAttribute("data-page", "comments");
+            });
+        });
+        document.getElementById("open-user").addEventListener("click", function () {
+            document.getElementById("page-type").setAttribute("data-page", "user");
+        });
+        document.getElementById("back-to-comments").addEventListener("click", function () {
+            document.getElementById("page-type").setAttribute("data-page", "comments");
+        });
+        document.getElementById("mock-action-btn").addEventListener("click", function () {
+            document.getElementById("relationship").setAttribute("data-relationship", "FOLLOWING");
+            document.getElementById("relationship").textContent = "FOLLOWING";
+        });
+
+        console.log("test page ready");
+    </script>
+</body>
+</html>

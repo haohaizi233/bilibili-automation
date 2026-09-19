@@ -1,0 +1,8 @@
+<resources>
+    <color name="bg">#121212</color>
+    <color name="panel">#1E1E1E</color>
+    <color name="text">#EEEEEE</color>
+    <color name="accent">#4FC3F7</color>
+    <color name="error">#EF9A9A</color>
+    <color name="compose_bg">#F8FBFF</color>
+</resources>

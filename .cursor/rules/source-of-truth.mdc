@@ -1,0 +1,96 @@
+---
+description: Android APK 唯一正式源码是 app/src/**；reference-python-desktop/ 与 UI/、HTML/、design-reference/ 均为只读参考，禁止直接迁移或修改
+alwaysApply: true
+---
+
+# 项目源码边界（必须遵守）
+
+## 1. 唯一正式 Android 源码
+
+正式 Android Truth Source **只有**：
+
+```
+app/src/**
+```
+
+判断某个 Android 功能是否"已完成 / 已实现"，**只能**以 `app/src/**` 中的 Kotlin 代码为准。
+
+## 2. reference-python-desktop/ 的定位
+
+`reference-python-desktop/`（旧名 `参考/`）是 **旧的 Universal Crawler Pro Python/PyQt6/Playwright 桌面工程**。
+
+它 **不是** 当前 Android APK 的正式源码。
+
+### 禁止事项
+
+1. **禁止修改** `reference-python-desktop/` 中的任何文件。
+2. **禁止把** `reference-python-desktop/` 中的 Python / PyQt6 代码直接复制到 Android 工程。
+3. **禁止根据** `reference-python-desktop/` 判断 Android 功能已经完成。
+4. **禁止把** PyQt UI、Windows API、桌面 packaging、桌面下载器等桌面专属代码迁入 APK。
+
+### 仅允许参考的"架构思想"
+
+- EventBus 的解耦思想
+- Worker 串行执行模型
+- AppState 单一状态源思想
+- Controller / Service 分层
+- Structured Logging
+- RateLimiter
+- CrawlBudget
+- Task cancellation
+- 生命周期与 shutdown
+- Mermaid 架构设计
+
+参考时只能提取**思想**，再用 Android 原生技术重新实现。
+
+## 3. UI 参考目录的定位
+
+以下三个目录都是 **UI 视觉参考稿**，仅供对照参考：
+
+- `design-reference/`
+- `UI/`
+- `HTML/`
+
+### 禁止事项
+
+1. **禁止修改** 这三个目录中的任何文件（PNG / HTML / CSS / JS 等一律不动）。
+2. **禁止把** 它们中的 HTML / CSS / JS 直接搬进 Android 工程。
+3. **禁止根据** 它们判断 Android UI 功能已经完成 —— 是否完成只能以 `app/src/**` 中的 Compose 代码为准。
+
+### 仅允许的用法
+
+- 看 UI 视觉稿，理解布局、配色、组件形态、交互意图。
+- 在 `app/src/**` 中用 Jetpack Compose 重新实现等价 UI。
+
+## 4. Python → Android 原生实现映射
+
+| Python 桌面端                | Android 必须使用的原生实现            |
+|------------------------------|---------------------------------------|
+| Python EventBus               | Kotlin `SharedFlow` / `StateFlow`     |
+| Python Worker                | Coroutine + `Channel` / Actor        |
+| `threading.Thread`           | Coroutine                             |
+| PyQt Signal                  | `Flow` / callback                     |
+| AppState                     | `UiState` / Repository                |
+| PyQt GUI                     | Jetpack Compose                       |
+| SQLite / Python model        | Room                                  |
+| Playwright Browser           | Android WebView + BrowserActor        |
+
+> 任何在 `reference-python-desktop/` 中看到的概念，落到 Android 时**必须**走右列对应实现，而不是把左列代码搬过来。
+
+## 5. 根目录约定
+
+```
+bilibili自动化/
+├── app/                         ← Android 正式源码（唯一 truth source）
+├── design-reference/            ← UI 参考稿（只读）
+├── UI/                           ← UI 参考稿（只读）
+├── HTML/                         ← UI 参考稿（只读）
+├── reference-python-desktop/    ← 旧 Python 桌面工程，仅供思想参考（只读）
+├── docs/
+├── gradle/
+└── ...
+```
+
+- 改 Android 实现时，只读 `app/src/**`。
+- 想看架构思想，可读 `reference-python-desktop/`，但**不得**复制代码。
+- 想看 UI 视觉稿，看 `design-reference/`、`UI/`、`HTML/`，但**不得**修改，也**不得**直接搬 HTML/CSS/JS。

@@ -1,0 +1,250 @@
+# 公网网络边界工程约束：Playwright、HLS DNS 与平台 URL
+
+> 本文记录项目中外部 URL 从输入、浏览器访问到 HLS 传输的统一安全边界。凡是由用户输入、站点返回值、重定向或页面脚本决定目标地址的代码，都必须遵守本文约束。
+
+更新日期：2026-07-29
+
+## 结论
+
+公网访问不能只在入口做一次字符串检查。当前项目按三层边界处理：
+
+| 层级 | 统一做法 | 防止的问题 |
+| --- | --- | --- |
+| 平台输入层 | 用解析后的 `hostname` 做精确域名或真实子域匹配 | `bilibili.com.attacker.example` 等伪子域绕过、登录入口跳到外域 |
+| Playwright 浏览器层 | 在 `BrowserContext` 上安装共享守卫，并关闭额外脚本网络通道 | popup 首请求、子资源、WebSocket、Worker、Service Worker 绕过 |
+| HLS 传输层 | 先解析并验证公网地址，再用 `CurlOpt.RESOLVE` 固定本次连接 | URL 校验后发生 DNS rebinding，连接落到内网地址 |
+
+三层检查不能互相替代：合法平台域名仍需网络地址策略，浏览器 URL 路由也不等于传输层 DNS pinning。
+
+## Playwright：守卫必须属于 BrowserContext
+
+公网策略必须安装在 `BrowserContext`，并且必须在创建任何 `Page`、popup 或发起导航之前完成。只给单个 `Page` 安装 `route()` 不足以构成完整边界，因为 popup 的首次导航可能发生在页面级路由接管之前，而同一 context 中后续创建的页面也不会自动继承 page 级处理器。
+
+项目统一入口是 `shared/playwright_network_guard.py` 中的 `install_public_network_guard()`。推荐调用顺序：
+
+```python
+context_kwargs["service_workers"] = "block"
+context = browser.new_context(**context_kwargs)
+install_public_network_guard(context, public_domain_policy)
+page = context.new_page()
+```
+
+不得把上述顺序改成“先创建页面或导航，再补装守卫”。不得在某个平台内复制一套弱化版 URL 检查。
+
+相关 Playwright 行为与 API 参考：
+
+- [BrowserContext API](https://playwright.dev/python/docs/api/class-browsercontext)
+- [WebSocketRoute API](https://playwright.dev/python/docs/api/class-websocketroute)
+
+### `page.request` / `APIRequestContext` 不受 BrowserContext 路由保护
+
+`page.request` 虽然从 Page 取得，但它发起的是 `APIRequestContext` 请求，不会经过
+`BrowserContext.route()` 或本项目的 context 公网守卫。因此不得把 `page.request.get()`
+当成已受浏览器路由保护的等价请求。
+
+- 对仅用于检查固定官方端点的探针，显式设置 `max_redirects=0`，任何 3xx 失败关闭。
+- 必须跟随重定向时，禁用自动跟随，由代码逐跳解析 `Location`、执行域名/公网地址校验，再发起下一跳。
+- 回归测试必须覆盖外域与内网 `Location`，并断言它们没有被跟随。
+
+参数语义见 [APIRequestContext API](https://playwright.dev/python/docs/api/class-apirequestcontext)。快手固定 profile
+探针按此约束设置 `max_redirects=0`，失败后回退到受 BrowserContext 守卫的 DOM 校验。
+
+### 为什么必须使用 BrowserContext
+
+`BrowserContext` 是一个浏览器会话内页面、popup、子资源和脚本初始化的共同所有者。把策略安装在 context 有三个直接收益：
+
+1. 覆盖当前页面以及之后创建的所有页面。
+2. 覆盖 popup 的首次导航；这是 `Page.route()` 无法可靠覆盖的关键窗口。
+3. context 级 `add_init_script()` 会在页面脚本运行前生效，可统一关闭额外网络通道。
+
+`BaseSpider._ensure_playwright_public_route()` 仍保留 Page fallback，只用于旧版 Playwright 或测试替身缺少部分 context 能力的情况。正常生产代码必须优先传入 context；fallback 只补齐 context 缺失的能力，不能反过来成为默认路径。
+
+### 当前防护面
+
+共享守卫按失败关闭原则处理以下通道：
+
+| 通道 | 当前策略 | 原因 |
+| --- | --- | --- |
+| HTTP / HTTPS 导航与子资源 | context `route("**/*")` 逐请求调用 `DomainPolicyEngine.require_public_url()`；违规请求以 `blockedbyclient` 中止 | 阻止 loopback、私网、链路本地地址及不允许的 URL |
+| popup 首次导航 | 由 context 路由统一接管 | page 级路由存在首次请求窗口 |
+| WebSocket | `route_web_socket()` 做二次 URL 校验；页面初始化脚本同时禁用 `WebSocket` 构造器 | 避免 HTTP 路由之外的长连接绕过 |
+| Worker / SharedWorker | 初始化脚本把构造器替换为抛出 `SecurityError` 的失败关闭实现 | Worker 可形成独立脚本与网络执行面 |
+| Service Worker | 创建 context 时显式设置 `service_workers="block"` | Service Worker 接管请求后，路由层可能看不到真实网络访问 |
+| `about:` / `blob:` / `data:` | HTTP 路由允许继续；脚本网络构造器仍受限制 | 保留页面本地资源能力，不把它们误判成公网 URL |
+
+守卫使用 context/page 标记保证重复安装幂等。安装脚本或路由失败时必须抛出 `DomainPolicyViolation`，不得记录日志后继续无保护导航。
+
+### 兼容性取舍
+
+受公网策略保护的 context 当前禁用 WebSocket、Worker、SharedWorker 和 Service Worker。这会降低依赖这些能力的网站兼容性，但比允许页面脚本绕过 URL 策略更安全。
+
+如果某个平台确实必须使用其中一种能力，不能直接删除初始化脚本或给单个平台加静默开关。应先完成独立威胁建模，提供等价的逐连接/逐请求校验，并补真实浏览器回归；在此之前保持失败关闭。
+
+## curl_cffi HLS：校验后固定 DNS 结果
+
+只调用 `DomainPolicyEngine.require_public_url()` 仍存在检查与使用时机差异：策略校验时域名可以解析到公网地址，`session.get()` 真正连接时再次解析却可能得到 loopback 或私网地址。
+
+`app/core/downloaders/m3u8.py::_curl_cffi_session_response()` 的公网策略路径现在委托
+`shared/network/pinned_transport.py::PinnedTransport`，并逐跳执行：
+
+1. 规范化 HTTP(S) URL、hostname、真实端口和 authority；拒绝 userinfo、模糊数字 IP 与歧义端口。
+2. 调用 `resolve_public_addresses(current_url)`，同时完成 URL 校验并取得本次已验证的地址集合。
+3. 正常生产路径只接受传输模块自己创建的精确 `curl_cffi.requests.Session`，并验证其请求合并状态仍是项目声明版本的安全默认值。显式 `session_factory` 若返回任何真实 `Session`（包括子类），必须先关闭再在联网前拒绝；factory 注入只保留给不执行真实网络的测试替身。这样调用方无法把默认 Host/Authorization headers、Cookie、auth、base URL、params、proxy、代理认证、弱化的证书校验、额外 JA3/Akamai/指纹、interface、客户端证书或自定义响应/重试行为带入传输边界。
+4. 每一跳都先调用底层 `Curl.reset()` 清除 URL、`CONNECT_TO` 等单次传输状态，再只设置模块权威的完整 `curl_options` 映射：`CurlOpt.NOSIGNAL=1`、`CurlOpt.FRESH_CONNECT=1`、`CurlOpt.FORBID_REUSE=1`、本跳 `CurlOpt.RESOLVE` 和 `CurlOpt.PROXY=""`。[`curl_easy_reset`](https://curl.se/libcurl/c/curl_easy_reset.html) 明确不会清除存活连接、DNS cache、Cookie 或 share 关联，因此不能把 reset 当成连接隔离；[`CURLOPT_FRESH_CONNECT`](https://curl.se/libcurl/c/CURLOPT_FRESH_CONNECT.html) 强制下一跳新建连接，[`CURLOPT_FORBID_REUSE`](https://curl.se/libcurl/c/CURLOPT_FORBID_REUSE.html) 要求该跳完成后关闭连接。IPv6 地址使用方括号，IPv4 与 IPv6 可以同时固定。setter 前保存独立深快照，setter 后回读并精确复核整张映射；任何多键、少键、替换值或嵌套列表原地变异都必须在 request 前失败关闭。
+5. 关闭 curl 自动重定向并手动解析 `Location`；每一跳重新规范化、解析、验证和 pinning，跨源时剥离 Cookie、Authorization、Host 和代理认证头。POST/PUT 等请求因 301/302/303 改写为 GET 时必须同时清空请求体、四个 [Fetch `request-body header`](https://fetch.spec.whatwg.org/#request-body-header-name)（Content-Encoding、Content-Language、Content-Location、Content-Type）以及 Content-Length、Transfer-Encoding、Trailer、Expect；303 保留 HEAD 方法时也不得把原请求体或这些陈旧声明带到下一跳。
+6. 同源跳可以复用本次私有 Session 的 Cookie 状态，但每跳仍必须新建底层连接；跨源跳关闭旧 Session 并剥离敏感请求头。整次操作结束时无论成功或异常都关闭响应与 Session，固定项不会污染调用方或后续任务。
+7. 超时、响应体和重定向数必须是有限且类型明确的预算；共享传输的单次总超时上限为 86,400 秒，有限但超出上限的值同样拒绝。总 deadline 必须覆盖 resolver、Session 创建、handle reset、option 写入/回读和响应完成，在真正 request 前及响应返回后重新核对，不能拿过期的正 timeout 继续联网。请求头字段名或值含控制字符时，在 DNS 和网络请求前失败关闭。响应体上限对每一跳生效，不能只检查最终 2xx；若 callback 已收集的字节与 `response.content` 同时存在却不一致，必须失败关闭，不能挑较短的一份返回。
+
+当前 `curl_cffi` 版本的 `Session.get()` 不接受请求级 `curl_options`。不能为了代码看起来更局部而传入一个运行时不支持的参数；固定解析由共享传输在自有私有 Session 的 `curl_options` 上完成。如果 Session 不暴露可设置并可精确回读的 `curl_options` 字典、默认请求状态发生版本漂移、handle 无法逐跳复位，或 factory 试图注入真实 Session，公网策略路径都必须失败关闭。
+
+禁止退回以下写法：
+
+```python
+policy.require_public_url(url)
+session.get(url)  # 实际连接会再次解析 DNS，未固定已验证地址
+```
+
+最低回归要求：
+
+- 断言请求执行期间存在 `CurlOpt.RESOLVE`。
+- 覆盖非默认端口，例如 `8443`。
+- 同时覆盖 IPv4 和 IPv6 格式。
+- 断言没有给 `Session.get()` 传入不兼容的请求级 `curl_options`。
+- 成功、异常和重定向后都关闭本次私有响应/Session，不污染调用方 Session。
+- 私网首跳和私网重定向在发起下一次请求前被拒绝。
+- `NaN`/无限或超过 86,400 秒的超时、非整数大小或重定向预算，以及 CR/LF/NUL 请求头在联网前被拒绝。
+- 测试替身即使保留 RESOLVE/PROXY，也不得注入 URL/CONNECT_TO 等额外 steering 键；删除或替换权威键、原地改写 `CurlOpt.RESOLVE` 列表同样必须在真正 request 前被独立深快照和全映射精确回读拒绝。
+- 显式 factory 返回的真实 Session 及其子类必须关闭并在零网络请求时拒绝；真实同源重定向应使用两个监听地址证明第二跳命中新 pin，而不是复用第一跳连接。
+- resolver、Session factory/options 准备或响应完成跨过总 deadline 时必须失败；准备阶段超时不得调用 request。
+- callback/raw 双通道不一致必须失败关闭；302 等中间响应的实际响应体也必须在跟随下一跳前执行同一大小上限。
+- POST/PUT/HEAD 的 301/302/303 跳转必须同时断言下一跳方法、请求体和 body/framing 请求头，不能只断言 URL 或方法。
+
+对应测试入口是 `tests/unit/shared/network/test_pinned_transport.py`、`tests/integration/app/core/downloaders/test_runtime.py` 和 `tests/integration/app/core/downloaders/m3u8/test_lifecycle.py`。
+
+快手分享短链的请求级 DNS 固定、保存态 Cookie 逐跳筛选，以及从详情响应到签名 CDN 地址的交接约束，见 [快手 Playwright 会话启动与闪窗排障实践](kuaishou-playwright-session-startup.md#短链-http-快路cookie-与-cdn-交接)。该文档描述平台专用流水线；本节仍是共享 HLS 传输层的安全基线。
+
+## 平台 URL：授权 hostname，不授权字符串片段
+
+URL 提取、URL 归一化和主机授权是三个不同步骤。代码从分享文案中提取出一个看起来像 URL 的字符串后，仍必须通过 `urllib.parse.urlparse/urlsplit` 取得 `hostname`，再做授权判断。
+
+### Bilibili
+
+普通站点只接受：
+
+```python
+host == "bilibili.com" or host.endswith(".bilibili.com")
+```
+
+短链域名只接受项目声明列表中的精确 hostname，例如 `b23.tv`、`bili2233.cn`、`bili22.cn`。不要使用 `"bilibili.com" in netloc`、`netloc.endswith("bilibili.com")` 或对完整 URL 做子串判断，因为这些写法会错误接受：
+
+- `bilibili.com.attacker.example`
+- `notbilibili.com`
+- `bilibili.com@attacker.example`
+
+不在授权主机集合内的 URL 应按普通搜索词处理，不能进入 Bilibili 页面扫描或视频直取路径。
+
+### Xiaohongshu
+
+登录 bootstrap 入口只接受 `xiaohongshu.com`、`xhslink.com`、`xhslink.cn` 的精确域名或真实子域。输入是外域、伪子域或解析失败时，必须在创建登录页面前回退到 `HOME_URL`，不能把未授权地址交给带 Cookie 的登录 context。
+
+短链跟随后得到的每一跳仍要经过 URL/公网策略；“初始短链域名合法”不代表重定向目标自动可信。
+
+平台主机回归至少覆盖：
+
+- 官方根域名和真实子域正常路由。
+- 官方短链域名正常路由。
+- `official-domain.attacker.example` 被拒绝。
+- `notofficial-domain` 和 userinfo 混淆被拒绝。
+- 小红书不可信登录入口回退 `HOME_URL`，可信入口保持原值。
+
+对应测试入口是 `tests/unit/app/spiders/test_helpers.py` 和 `tests/integration/app/spiders/xiaohongshu/test_runtime.py`。
+
+## 已知边界：Playwright DNS 二次解析
+
+context 路由验证的是 URL 及策略解析结果，但 Chromium 在实际连接时仍可能再次解析主机名。因此，这套守卫不能被描述为已经彻底消除 DNS rebinding 的传输层 TOCTOU（检查与使用时机差异）。
+
+### Chromium DoH 增强引导只解决可用性
+
+当系统 DNS 自身已经故障时，仅传入空格分隔的 DoH URI template 仍可能无法解析 DoH
+服务主机。Chromium M103+ 的 `DnsOverHttpsConfig` 支持 JSON 形式；当前项目通过
+`shared/resilient_dns.py::chromium_resilient_dns_args()` 把每个受信 DoH template 与
+`endpoints[].ips` 一起传入，使 Chromium 能用预置地址完成首个 TLS 连接，同时仍按原
+DoH hostname 校验证书。格式依据见 [Chromium DoH 文档](https://www.chromium.org/developers/dns-over-https/)
+和 [`DnsOverHttpsConfig` 源码契约](https://chromium.googlesource.com/chromium/src/+/main/net/dns/public/dns_over_https_config.h)。
+
+这项增强引导只恢复浏览器在系统 DNS 故障下的解析能力，不固定目标网站最终连接的 IP，
+也不替代公网 URL 守卫：
+
+- DoH bootstrap IP 只能属于配置中的 DoH 服务，不得来自待访问页面或用户输入。
+- JSON 中必须同时保留 HTTPS template 和 IP；不能把 DoH hostname 直接替换为 IP 并跳过 TLS/SNI。
+- 目标页面、popup、子资源和脚本网络通道仍必须经过 context 公网策略。
+- 回归测试必须解析最终 `--dns-over-https-templates` JSON，并断言 template 与
+  `endpoints[].ips` 成对存在；测试入口为 `tests/unit/shared/network/test_resilient_dns.py`。
+
+当前项目已经对 `curl_cffi` HLS 路径使用 `CurlOpt.RESOLVE` 固定已验证地址；Playwright HTTP 传输若要达到同等级别，需要引入验证代理、浏览器级 IP pinning 或等价的传输层方案。未完成该方案前：
+
+- 文档和 CR 结论必须明确保留这个残余风险。
+- 不得把 URL 路由校验等同于连接地址固定。
+- 不得为了“看起来已解决”而在证书、Cookie、重定向或 CORS 语义不完整的情况下自行代理 HTTPS。
+
+## 接入要求
+
+新增或修改外部 URL 路径时先判断它属于输入、浏览器或直接传输中的哪些层级；经过前一层不代表可以跳过后一层。
+
+新增或修改 Playwright context 时按以下顺序检查：
+
+1. 判断目标是否可能由外部输入、页面内容或重定向决定；若是，使用公网 `DomainPolicyEngine`。
+2. 在 `browser.new_context()` 参数中加入 `service_workers="block"`。
+3. context 创建后立即调用 `install_public_network_guard(context, policy)`。
+4. 完成守卫安装后，才能应用其他 init script、创建 Page、恢复 Cookie 或导航。
+5. 所有重定向、popup、子资源和备用浏览器路径必须复用同一策略。
+6. 安装失败、策略能力缺失或 URL 校验失败时必须停止该路径。
+
+当前生产接入点包括：
+
+- `app/spiders/base.py`：Spider 通用 Playwright 页面。
+- `app/spiders/douyin/spider.py`：抖音登录子进程 context。
+- `app/core/downloaders/m3u8.py`：HLS Playwright 兜底 context。
+- `app/core/downloaders/m3u8.py`：curl_cffi HLS 逐跳验证与 DNS pinning。
+- `app/spiders/bilibili/input_router.py`：Bilibili 输入 hostname 授权。
+- `app/spiders/xiaohongshu/spider.py`：小红书登录入口 hostname 授权与安全回退。
+
+## 回归测试要求
+
+安全回归不能只检查源码字符串或注释，必须验证行为。最低覆盖包括：
+
+- 私网 HTTP 子资源被 abort，且不会调用 `continue_()`。
+- context 路由在 Page 创建前安装，popup 首次私网请求无法到达真实 loopback TCP listener。
+- 私网 WebSocket 不会连接服务器。
+- `WebSocket`、`Worker`、`SharedWorker` 构造器在真实 Chromium 中抛出 `SecurityError`。
+- 所有受保护 context 都显式设置 `service_workers="block"`。
+- 守卫重复安装不会注册重复 handler。
+- 旧版测试替身缺少 context 能力时，Page fallback 只补缺失能力。
+
+对应测试入口：
+
+- `tests/unit/app/spiders/test_base.py`
+- `tests/integration/app/core/downloaders/m3u8/test_lifecycle.py`
+- `tests/unit/app/spiders/test_helpers.py`
+- `tests/integration/app/spiders/xiaohongshu/test_runtime.py`
+- `tests/integration/app/core/downloaders/test_runtime.py`
+- `tests/e2e/web/test_browser_journeys.py`（聚合 `tests/support/browser_cases/network_guard.py`）
+
+## CR 检查清单
+
+- [ ] 守卫是否安装在 `BrowserContext`，而不是只安装在 Page？
+- [ ] 是否在任何 Page、popup 或导航创建前完成安装？
+- [ ] 是否显式阻止 Service Worker？
+- [ ] WebSocket、Worker 和 SharedWorker 是否仍保持失败关闭，或已有经审查的等价保护？
+- [ ] 新增浏览器备用路径是否复用共享守卫？
+- [ ] `page.request` / `APIRequestContext` 是否禁止自动重定向，或已对每一跳重新执行公网校验？
+- [ ] 是否包含真实 popup 首请求和脚本网络通道回归？
+- [ ] 结论是否诚实区分 URL 校验与传输层 DNS pinning？
+- [ ] curl_cffi 公网请求是否把已验证地址固定到真实连接，并在请求后关闭本次私有 Session？
+- [ ] 自定义端口和 IPv6 是否包含在 DNS pinning 回归中？
+- [ ] 每跳 `curl_options` 是否只包含 NOSIGNAL、FRESH_CONNECT、FORBID_REUSE、RESOLVE、PROXY 这组模块权威映射，并在 setter 后完成独立深快照的全映射精确复核？
+- [ ] 真实 Session 是否只由传输模块创建，显式 factory 注入是否在联网前关闭拒绝，handle 是否逐跳 reset 且不复用旧连接？
+- [ ] 响应体预算是否覆盖每一跳，并拒绝 callback 与 raw body 不一致？
+- [ ] 公网传输预算是否有限且类型明确，总 deadline 是否覆盖 resolver、Session/options 准备和响应完成，请求头控制字符是否在联网前失败关闭？
+- [ ] 平台域名是否基于解析后的 hostname 做精确域名/真实子域判断，而不是字符串包含？
+- [ ] 带登录 Cookie 的浏览器入口遇到外域或伪子域时是否在创建页面前安全回退？
