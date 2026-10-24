@@ -51,6 +51,10 @@ class UserRepository(
 
     suspend fun count(): Int = withContext(Dispatchers.IO) { dao.count() }
 
+    suspend fun deleteAll() = withContext(Dispatchers.IO) {
+        dao.deleteAll()
+    }
+
     private fun UserEntity.toModel() = User(
         uid = uid,
         nickname = nickname,

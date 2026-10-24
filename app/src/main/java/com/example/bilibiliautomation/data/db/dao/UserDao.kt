@@ -28,4 +28,7 @@ interface UserDao {
 
     @Query("SELECT COUNT(*) FROM users")
     suspend fun count(): Int
+
+    @Query("DELETE FROM users")
+    suspend fun deleteAll()
 }

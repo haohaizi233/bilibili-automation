@@ -8,5 +8,10 @@ data class AppSettings(
     val cooldownMinutes: Int = 30,
     val dailyLimit: Int = 200,
     val notificationEnabled: Boolean = true,
-    val debugEnabled: Boolean = true,
+    val debugEnabled: Boolean = false,
+    val parallelTasks: Boolean = false,
+    val smartStatus: Boolean = true,
+    val autoSwitchAccount: Boolean = true,
+    val autoRetry: Boolean = true,
+    val unattendedMode: Boolean = false,
 )

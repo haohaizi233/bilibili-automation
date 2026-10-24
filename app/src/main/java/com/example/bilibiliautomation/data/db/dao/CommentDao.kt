@@ -22,4 +22,7 @@ interface CommentDao {
 
     @Query("UPDATE comments SET processed = 1, processedAt = :processedAt WHERE commentId = :commentId")
     suspend fun markProcessed(commentId: String, processedAt: Long)
+
+    @Query("DELETE FROM comments")
+    suspend fun deleteAll()
 }

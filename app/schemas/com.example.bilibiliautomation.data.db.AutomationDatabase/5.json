@@ -1,0 +1,1004 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 5,
+    "identityHash": "20e83dc4faa08f21b1ade568468d3156",
+    "entities": [
+      {
+        "tableName": "accounts",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `uid` TEXT NOT NULL, `nickname` TEXT NOT NULL, `avatarUrl` TEXT NOT NULL, `status` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, `lastLoginAt` INTEGER, `lastValidatedAt` INTEGER, `cooldownUntil` INTEGER, `disabled` INTEGER NOT NULL, `lastErrorCode` TEXT, `lastErrorMessage` TEXT, `sessionProfileId` TEXT, `fansCount` INTEGER NOT NULL, `followingCount` INTEGER NOT NULL)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "uid",
+            "columnName": "uid",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "nickname",
+            "columnName": "nickname",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "avatarUrl",
+            "columnName": "avatarUrl",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAt",
+            "columnName": "updatedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastLoginAt",
+            "columnName": "lastLoginAt",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "lastValidatedAt",
+            "columnName": "lastValidatedAt",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "cooldownUntil",
+            "columnName": "cooldownUntil",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "disabled",
+            "columnName": "disabled",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastErrorCode",
+            "columnName": "lastErrorCode",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "lastErrorMessage",
+            "columnName": "lastErrorMessage",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "sessionProfileId",
+            "columnName": "sessionProfileId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "fansCount",
+            "columnName": "fansCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "followingCount",
+            "columnName": "followingCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_accounts_uid",
+            "unique": true,
+            "columnNames": [
+              "uid"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_accounts_uid` ON `${TABLE_NAME}` (`uid`)"
+          },
+          {
+            "name": "index_accounts_status",
+            "unique": false,
+            "columnNames": [
+              "status"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_accounts_status` ON `${TABLE_NAME}` (`status`)"
+          },
+          {
+            "name": "index_accounts_createdAt",
+            "unique": false,
+            "columnNames": [
+              "createdAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_accounts_createdAt` ON `${TABLE_NAME}` (`createdAt`)"
+          },
+          {
+            "name": "index_accounts_sessionProfileId",
+            "unique": false,
+            "columnNames": [
+              "sessionProfileId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_accounts_sessionProfileId` ON `${TABLE_NAME}` (`sessionProfileId`)"
+          }
+        ]
+      },
+      {
+        "tableName": "targets",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `uid` TEXT NOT NULL, `nickname` TEXT NOT NULL, `avatarUrl` TEXT NOT NULL, `enabled` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, `lastScanAt` INTEGER, `fansCount` INTEGER NOT NULL)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "uid",
+            "columnName": "uid",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "nickname",
+            "columnName": "nickname",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "avatarUrl",
+            "columnName": "avatarUrl",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "enabled",
+            "columnName": "enabled",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAt",
+            "columnName": "updatedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastScanAt",
+            "columnName": "lastScanAt",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "fansCount",
+            "columnName": "fansCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_targets_uid",
+            "unique": true,
+            "columnNames": [
+              "uid"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_targets_uid` ON `${TABLE_NAME}` (`uid`)"
+          },
+          {
+            "name": "index_targets_enabled",
+            "unique": false,
+            "columnNames": [
+              "enabled"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_targets_enabled` ON `${TABLE_NAME}` (`enabled`)"
+          },
+          {
+            "name": "index_targets_createdAt",
+            "unique": false,
+            "columnNames": [
+              "createdAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_targets_createdAt` ON `${TABLE_NAME}` (`createdAt`)"
+          }
+        ]
+      },
+      {
+        "tableName": "videos",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`bvid` TEXT NOT NULL, `targetUid` TEXT NOT NULL, `title` TEXT NOT NULL, `processed` INTEGER NOT NULL, `lastCommentCursor` TEXT, `processedCommentCount` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, `processedAt` INTEGER, PRIMARY KEY(`bvid`))",
+        "fields": [
+          {
+            "fieldPath": "bvid",
+            "columnName": "bvid",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "targetUid",
+            "columnName": "targetUid",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "processed",
+            "columnName": "processed",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastCommentCursor",
+            "columnName": "lastCommentCursor",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "processedCommentCount",
+            "columnName": "processedCommentCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAt",
+            "columnName": "updatedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "processedAt",
+            "columnName": "processedAt",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "bvid"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_videos_bvid",
+            "unique": true,
+            "columnNames": [
+              "bvid"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_videos_bvid` ON `${TABLE_NAME}` (`bvid`)"
+          },
+          {
+            "name": "index_videos_targetUid",
+            "unique": false,
+            "columnNames": [
+              "targetUid"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_videos_targetUid` ON `${TABLE_NAME}` (`targetUid`)"
+          },
+          {
+            "name": "index_videos_processed",
+            "unique": false,
+            "columnNames": [
+              "processed"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_videos_processed` ON `${TABLE_NAME}` (`processed`)"
+          },
+          {
+            "name": "index_videos_createdAt",
+            "unique": false,
+            "columnNames": [
+              "createdAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_videos_createdAt` ON `${TABLE_NAME}` (`createdAt`)"
+          }
+        ]
+      },
+      {
+        "tableName": "comments",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`commentId` TEXT NOT NULL, `videoId` TEXT NOT NULL, `userUid` TEXT NOT NULL, `isRootComment` INTEGER NOT NULL, `processed` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL, `processedAt` INTEGER, PRIMARY KEY(`commentId`))",
+        "fields": [
+          {
+            "fieldPath": "commentId",
+            "columnName": "commentId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "videoId",
+            "columnName": "videoId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "userUid",
+            "columnName": "userUid",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "isRootComment",
+            "columnName": "isRootComment",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "processed",
+            "columnName": "processed",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "processedAt",
+            "columnName": "processedAt",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "commentId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_comments_commentId",
+            "unique": true,
+            "columnNames": [
+              "commentId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_comments_commentId` ON `${TABLE_NAME}` (`commentId`)"
+          },
+          {
+            "name": "index_comments_videoId",
+            "unique": false,
+            "columnNames": [
+              "videoId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_comments_videoId` ON `${TABLE_NAME}` (`videoId`)"
+          },
+          {
+            "name": "index_comments_userUid",
+            "unique": false,
+            "columnNames": [
+              "userUid"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_comments_userUid` ON `${TABLE_NAME}` (`userUid`)"
+          },
+          {
+            "name": "index_comments_isRootComment",
+            "unique": false,
+            "columnNames": [
+              "isRootComment"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_comments_isRootComment` ON `${TABLE_NAME}` (`isRootComment`)"
+          },
+          {
+            "name": "index_comments_createdAt",
+            "unique": false,
+            "columnNames": [
+              "createdAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_comments_createdAt` ON `${TABLE_NAME}` (`createdAt`)"
+          }
+        ]
+      },
+      {
+        "tableName": "users",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`uid` TEXT NOT NULL, `nickname` TEXT NOT NULL, `avatarUrl` TEXT NOT NULL, `relationshipState` TEXT NOT NULL, `firstSeenAt` INTEGER NOT NULL, `lastSeenAt` INTEGER NOT NULL, `lastActionAt` INTEGER, PRIMARY KEY(`uid`))",
+        "fields": [
+          {
+            "fieldPath": "uid",
+            "columnName": "uid",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "nickname",
+            "columnName": "nickname",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "avatarUrl",
+            "columnName": "avatarUrl",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "relationshipState",
+            "columnName": "relationshipState",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "firstSeenAt",
+            "columnName": "firstSeenAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastSeenAt",
+            "columnName": "lastSeenAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastActionAt",
+            "columnName": "lastActionAt",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "uid"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_users_uid",
+            "unique": true,
+            "columnNames": [
+              "uid"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_users_uid` ON `${TABLE_NAME}` (`uid`)"
+          },
+          {
+            "name": "index_users_relationshipState",
+            "unique": false,
+            "columnNames": [
+              "relationshipState"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_users_relationshipState` ON `${TABLE_NAME}` (`relationshipState`)"
+          },
+          {
+            "name": "index_users_lastSeenAt",
+            "unique": false,
+            "columnNames": [
+              "lastSeenAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_users_lastSeenAt` ON `${TABLE_NAME}` (`lastSeenAt`)"
+          }
+        ]
+      },
+      {
+        "tableName": "action_history",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `accountUid` TEXT NOT NULL, `targetUid` TEXT, `sourceTargetUid` TEXT, `sourceVideoId` TEXT, `sourceCommentId` TEXT, `actionType` TEXT NOT NULL, `beforeState` TEXT, `afterState` TEXT, `resultCode` TEXT NOT NULL, `resultMessage` TEXT, `createdAt` INTEGER NOT NULL)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "accountUid",
+            "columnName": "accountUid",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "targetUid",
+            "columnName": "targetUid",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "sourceTargetUid",
+            "columnName": "sourceTargetUid",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "sourceVideoId",
+            "columnName": "sourceVideoId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "sourceCommentId",
+            "columnName": "sourceCommentId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "actionType",
+            "columnName": "actionType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "beforeState",
+            "columnName": "beforeState",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "afterState",
+            "columnName": "afterState",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "resultCode",
+            "columnName": "resultCode",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "resultMessage",
+            "columnName": "resultMessage",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_action_history_accountUid",
+            "unique": false,
+            "columnNames": [
+              "accountUid"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_action_history_accountUid` ON `${TABLE_NAME}` (`accountUid`)"
+          },
+          {
+            "name": "index_action_history_targetUid",
+            "unique": false,
+            "columnNames": [
+              "targetUid"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_action_history_targetUid` ON `${TABLE_NAME}` (`targetUid`)"
+          },
+          {
+            "name": "index_action_history_sourceVideoId",
+            "unique": false,
+            "columnNames": [
+              "sourceVideoId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_action_history_sourceVideoId` ON `${TABLE_NAME}` (`sourceVideoId`)"
+          },
+          {
+            "name": "index_action_history_createdAt",
+            "unique": false,
+            "columnNames": [
+              "createdAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_action_history_createdAt` ON `${TABLE_NAME}` (`createdAt`)"
+          }
+        ]
+      },
+      {
+        "tableName": "tasks",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `status` TEXT NOT NULL, `targetUid` TEXT, `accountId` INTEGER, `groupId` INTEGER, `groupIndex` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL, `startedAt` INTEGER, `pausedAt` INTEGER, `finishedAt` INTEGER, `lastError` TEXT)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "targetUid",
+            "columnName": "targetUid",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "accountId",
+            "columnName": "accountId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "groupId",
+            "columnName": "groupId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "groupIndex",
+            "columnName": "groupIndex",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "startedAt",
+            "columnName": "startedAt",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "pausedAt",
+            "columnName": "pausedAt",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "finishedAt",
+            "columnName": "finishedAt",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "lastError",
+            "columnName": "lastError",
+            "affinity": "TEXT"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_tasks_status",
+            "unique": false,
+            "columnNames": [
+              "status"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_tasks_status` ON `${TABLE_NAME}` (`status`)"
+          },
+          {
+            "name": "index_tasks_targetUid",
+            "unique": false,
+            "columnNames": [
+              "targetUid"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_tasks_targetUid` ON `${TABLE_NAME}` (`targetUid`)"
+          },
+          {
+            "name": "index_tasks_accountId",
+            "unique": false,
+            "columnNames": [
+              "accountId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_tasks_accountId` ON `${TABLE_NAME}` (`accountId`)"
+          },
+          {
+            "name": "index_tasks_createdAt",
+            "unique": false,
+            "columnNames": [
+              "createdAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_tasks_createdAt` ON `${TABLE_NAME}` (`createdAt`)"
+          }
+        ]
+      },
+      {
+        "tableName": "task_checkpoints",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`taskId` INTEGER NOT NULL, `workflowState` TEXT NOT NULL, `targetUid` TEXT, `videoId` TEXT, `videoIndex` INTEGER NOT NULL, `commentId` TEXT, `commentCursor` TEXT, `commentIndex` INTEGER NOT NULL, `currentUserUid` TEXT, `currentUrl` TEXT, `followed` INTEGER NOT NULL, `skipped` INTEGER NOT NULL, `failed` INTEGER NOT NULL, `videoTotal` INTEGER NOT NULL, `commentTotal` INTEGER NOT NULL, `currentVideoTitle` TEXT, `currentVideoCover` TEXT, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`taskId`))",
+        "fields": [
+          {
+            "fieldPath": "taskId",
+            "columnName": "taskId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "workflowState",
+            "columnName": "workflowState",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "targetUid",
+            "columnName": "targetUid",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "videoId",
+            "columnName": "videoId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "videoIndex",
+            "columnName": "videoIndex",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "commentId",
+            "columnName": "commentId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "commentCursor",
+            "columnName": "commentCursor",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "commentIndex",
+            "columnName": "commentIndex",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currentUserUid",
+            "columnName": "currentUserUid",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "currentUrl",
+            "columnName": "currentUrl",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "followed",
+            "columnName": "followed",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "skipped",
+            "columnName": "skipped",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "failed",
+            "columnName": "failed",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "videoTotal",
+            "columnName": "videoTotal",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "commentTotal",
+            "columnName": "commentTotal",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currentVideoTitle",
+            "columnName": "currentVideoTitle",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "currentVideoCover",
+            "columnName": "currentVideoCover",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "updatedAt",
+            "columnName": "updatedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "taskId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_task_checkpoints_taskId",
+            "unique": true,
+            "columnNames": [
+              "taskId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_task_checkpoints_taskId` ON `${TABLE_NAME}` (`taskId`)"
+          },
+          {
+            "name": "index_task_checkpoints_updatedAt",
+            "unique": false,
+            "columnNames": [
+              "updatedAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_task_checkpoints_updatedAt` ON `${TABLE_NAME}` (`updatedAt`)"
+          }
+        ]
+      },
+      {
+        "tableName": "task_groups",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `name` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "name",
+            "columnName": "name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAt",
+            "columnName": "updatedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_task_groups_updatedAt",
+            "unique": false,
+            "columnNames": [
+              "updatedAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_task_groups_updatedAt` ON `${TABLE_NAME}` (`updatedAt`)"
+          }
+        ]
+      },
+      {
+        "tableName": "task_group_members",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`groupId` INTEGER NOT NULL, `targetUid` TEXT NOT NULL, `sortOrder` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL, PRIMARY KEY(`groupId`, `targetUid`), FOREIGN KEY(`groupId`) REFERENCES `task_groups`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "groupId",
+            "columnName": "groupId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "targetUid",
+            "columnName": "targetUid",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sortOrder",
+            "columnName": "sortOrder",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "groupId",
+            "targetUid"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_task_group_members_groupId",
+            "unique": false,
+            "columnNames": [
+              "groupId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_task_group_members_groupId` ON `${TABLE_NAME}` (`groupId`)"
+          },
+          {
+            "name": "index_task_group_members_targetUid",
+            "unique": false,
+            "columnNames": [
+              "targetUid"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_task_group_members_targetUid` ON `${TABLE_NAME}` (`targetUid`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "task_groups",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "groupId"
+            ],
+            "referencedColumns": [
+              "id"
+            ]
+          }
+        ]
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '20e83dc4faa08f21b1ade568468d3156')"
+    ]
+  }
+}

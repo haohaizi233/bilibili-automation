@@ -22,12 +22,19 @@ class TaskRepository(
         dao.getById(id)?.toModel()
     }
 
-    suspend fun create(targetUid: String?, accountId: Long?): Task = withContext(Dispatchers.IO) {
+    suspend fun create(
+        targetUid: String?,
+        accountId: Long?,
+        groupId: Long? = null,
+        groupIndex: Int = 0,
+    ): Task = withContext(Dispatchers.IO) {
         val now = TimeMs.wallClock()
         val entity = TaskEntity(
             status = TaskStatus.QUEUED,
             targetUid = targetUid,
             accountId = accountId,
+            groupId = groupId,
+            groupIndex = groupIndex,
             createdAt = now,
         )
         val id = dao.insert(entity)
@@ -86,11 +93,18 @@ class TaskRepository(
         dao.getCheckpoint(taskId)?.toModel()
     }
 
+    suspend fun deleteAll() = withContext(Dispatchers.IO) {
+        dao.deleteAllCheckpoints()
+        dao.deleteAll()
+    }
+
     private fun TaskEntity.toModel() = Task(
         id = id,
         status = status,
         targetUid = targetUid,
         accountId = accountId,
+        groupId = groupId,
+        groupIndex = groupIndex,
         createdAt = createdAt,
         startedAt = startedAt,
         pausedAt = pausedAt,
