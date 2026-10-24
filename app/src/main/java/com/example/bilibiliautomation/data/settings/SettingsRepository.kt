@@ -17,32 +17,11 @@ class SettingsRepository(
 ) {
     private val dataStore = context.applicationContext.settingsDataStore
 
-    val settings: Flow<AppSettings> = dataStore.data.map { prefs ->
-        AppSettings(
-            defaultTimeoutMs = prefs[KEY_TIMEOUT] ?: 10_000L,
-            pollIntervalMs = prefs[KEY_POLL] ?: 200L,
-            operationIntervalMs = prefs[KEY_OP_INTERVAL] ?: 5_000L,
-            retryCount = prefs[KEY_RETRY] ?: 3,
-            cooldownMinutes = prefs[KEY_COOLDOWN] ?: 30,
-            dailyLimit = prefs[KEY_DAILY_LIMIT] ?: 200,
-            notificationEnabled = prefs[KEY_NOTIFICATION] ?: true,
-            debugEnabled = prefs[KEY_DEBUG] ?: true,
-        )
-    }
+    val settings: Flow<AppSettings> = dataStore.data.map { prefs -> prefs.toModel() }
 
     suspend fun update(transform: (AppSettings) -> AppSettings) {
         dataStore.edit { prefs ->
-            val current = AppSettings(
-                defaultTimeoutMs = prefs[KEY_TIMEOUT] ?: 10_000L,
-                pollIntervalMs = prefs[KEY_POLL] ?: 200L,
-                operationIntervalMs = prefs[KEY_OP_INTERVAL] ?: 5_000L,
-                retryCount = prefs[KEY_RETRY] ?: 3,
-                cooldownMinutes = prefs[KEY_COOLDOWN] ?: 30,
-                dailyLimit = prefs[KEY_DAILY_LIMIT] ?: 200,
-                notificationEnabled = prefs[KEY_NOTIFICATION] ?: true,
-                debugEnabled = prefs[KEY_DEBUG] ?: true,
-            )
-            val next = transform(current)
+            val next = transform(prefs.toModel())
             prefs[KEY_TIMEOUT] = next.defaultTimeoutMs
             prefs[KEY_POLL] = next.pollIntervalMs
             prefs[KEY_OP_INTERVAL] = next.operationIntervalMs
@@ -51,8 +30,29 @@ class SettingsRepository(
             prefs[KEY_DAILY_LIMIT] = next.dailyLimit
             prefs[KEY_NOTIFICATION] = next.notificationEnabled
             prefs[KEY_DEBUG] = next.debugEnabled
+            prefs[KEY_PARALLEL] = next.parallelTasks
+            prefs[KEY_SMART_STATUS] = next.smartStatus
+            prefs[KEY_AUTO_SWITCH] = next.autoSwitchAccount
+            prefs[KEY_AUTO_RETRY] = next.autoRetry
+            prefs[KEY_UNATTENDED] = next.unattendedMode
         }
     }
+
+    private fun androidx.datastore.preferences.core.Preferences.toModel(): AppSettings = AppSettings(
+        defaultTimeoutMs = this[KEY_TIMEOUT] ?: 10_000L,
+        pollIntervalMs = this[KEY_POLL] ?: 200L,
+        operationIntervalMs = this[KEY_OP_INTERVAL] ?: 5_000L,
+        retryCount = this[KEY_RETRY] ?: 3,
+        cooldownMinutes = this[KEY_COOLDOWN] ?: 30,
+        dailyLimit = this[KEY_DAILY_LIMIT] ?: 200,
+        notificationEnabled = this[KEY_NOTIFICATION] ?: true,
+        debugEnabled = this[KEY_DEBUG] ?: false,
+        parallelTasks = this[KEY_PARALLEL] ?: false,
+        smartStatus = this[KEY_SMART_STATUS] ?: true,
+        autoSwitchAccount = this[KEY_AUTO_SWITCH] ?: true,
+        autoRetry = this[KEY_AUTO_RETRY] ?: true,
+        unattendedMode = this[KEY_UNATTENDED] ?: false,
+    )
 
     private companion object {
         val KEY_TIMEOUT = longPreferencesKey("defaultTimeoutMs")
@@ -63,5 +63,10 @@ class SettingsRepository(
         val KEY_DAILY_LIMIT = intPreferencesKey("dailyLimit")
         val KEY_NOTIFICATION = booleanPreferencesKey("notificationEnabled")
         val KEY_DEBUG = booleanPreferencesKey("debugEnabled")
+        val KEY_PARALLEL = booleanPreferencesKey("parallelTasks")
+        val KEY_SMART_STATUS = booleanPreferencesKey("smartStatus")
+        val KEY_AUTO_SWITCH = booleanPreferencesKey("autoSwitchAccount")
+        val KEY_AUTO_RETRY = booleanPreferencesKey("autoRetry")
+        val KEY_UNATTENDED = booleanPreferencesKey("unattendedMode")
     }
 }
