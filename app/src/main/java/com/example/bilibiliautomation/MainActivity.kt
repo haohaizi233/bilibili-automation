@@ -1,7 +1,6 @@
 package com.example.bilibiliautomation
 
 import android.Manifest
-import android.os.Build
 import android.os.Bundle
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
@@ -51,10 +50,19 @@ class MainActivity : AppCompatActivity() {
     private val container get() = (application as AutomationApplication).container
     private var busyJob: Job? = null
     private var currentTab = 0
+    private var pendingMockStart = false
 
     private val notificationPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
-    ) { }
+    ) {
+        if (!pendingMockStart) return@registerForActivityResult
+        pendingMockStart = false
+        if (com.example.bilibiliautomation.util.KeepAlivePermissions.notificationsGranted(this)) {
+            startMockWorkflowInternal()
+        } else {
+            AutomationLogger.w("foreground service skipped — notification permission denied")
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -75,9 +83,6 @@ class MainActivity : AppCompatActivity() {
             "WebViewFeature.VISUAL_STATE_CALLBACK=" +
                 WebViewFeature.isFeatureSupported(WebViewFeature.VISUAL_STATE_CALLBACK),
         )
-        if (Build.VERSION.SDK_INT >= 33) {
-            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-        }
         refreshDebugPanel()
 
         findViewById<Button>(R.id.btnGo).setOnClickListener { goToUrl() }
@@ -232,6 +237,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startMockWorkflow() {
+        if (com.example.bilibiliautomation.util.KeepAlivePermissions.needsRuntimeNotificationPermission(this)) {
+            pendingMockStart = true
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            return
+        }
+        startMockWorkflowInternal()
+    }
+
+    private fun startMockWorkflowInternal() {
         lifecycleScope.launch {
             val account = accountVm.accounts.value.firstOrNull()
                 ?: container.accountManager.addAccount("10001", "mock-account")

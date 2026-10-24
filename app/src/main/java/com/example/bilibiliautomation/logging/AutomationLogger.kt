@@ -11,7 +11,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.TimeZone
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
@@ -28,8 +27,8 @@ object AutomationLogger {
     }
 
     private val listeners = CopyOnWriteArrayList<Listener>()
-    private val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).apply {
-        timeZone = TimeZone.getDefault()
+    private val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.CHINA).apply {
+        timeZone = TimeMs.BEIJING
     }
 
     private val _records = MutableStateFlow<List<LogRecord>>(emptyList())
@@ -37,6 +36,9 @@ object AutomationLogger {
 
     private val _events = MutableSharedFlow<LogRecord>(extraBufferCapacity = 256)
     val events: SharedFlow<LogRecord> = _events.asSharedFlow()
+
+    @Volatile
+    var verbose: Boolean = false
 
     @Volatile
     var lastAction: String = "-"
@@ -137,6 +139,7 @@ object AutomationLogger {
         accountId: Long? = currentAccountId,
         workflowState: String? = currentWorkflowState,
     ) {
+        if (level == LogLevel.DEBUG && !verbose) return
         if (level == LogLevel.ERROR) lastError = message
         emit(
             LogRecord(

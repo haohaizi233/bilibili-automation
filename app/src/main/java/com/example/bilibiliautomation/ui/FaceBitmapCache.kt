@@ -13,6 +13,8 @@ import okhttp3.Request
 import java.util.concurrent.TimeUnit
 
 object FaceBitmapCache {
+    private const val MAX_CACHE_KB = 4 * 1024
+
     private val http = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
@@ -20,7 +22,11 @@ object FaceBitmapCache {
         .followSslRedirects(true)
         .build()
 
-    private val cache = LruCache<String, Bitmap>(64)
+    private val cache = object : LruCache<String, Bitmap>(MAX_CACHE_KB) {
+        override fun sizeOf(key: String, value: Bitmap): Int {
+            return (value.byteCount / 1024).coerceAtLeast(1)
+        }
+    }
     private val logger = AutomationLogger
 
     suspend fun load(url: String?): Bitmap? {
@@ -83,5 +89,9 @@ object FaceBitmapCache {
         }.onFailure { error ->
             logger.w("face request failed url=$url ${error.javaClass.simpleName} ${error.message}")
         }.getOrNull()
+    }
+
+    fun clear() {
+        cache.evictAll()
     }
 }

@@ -16,6 +16,13 @@ object BiliApiEndpoints {
 
     const val QR_GENERATE = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
     const val QR_POLL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
+    const val LOGIN_CAPTCHA = "https://passport.bilibili.com/x/passport-login/captcha"
+    const val SMS_SEND = "https://passport.bilibili.com/x/passport-login/web/sms/send"
+    const val SMS_LOGIN = "https://passport.bilibili.com/x/passport-login/web/login/sms"
+    const val COUNTRY_LIST = "https://passport.bilibili.com/web/generic/country/list"
+    /** Official passport page used as HITL fallback when GeeTest must be completed by a human. */
+    const val PASSPORT_LOGIN = "https://passport.bilibili.com/login"
+    const val PASSPORT_H5_LOGIN = "https://passport.bilibili.com/h5-app/passport/login"
 
     const val USER_CARD = "https://api.bilibili.com/x/web-interface/card"
     const val SPACE_ACC_INFO = "https://api.bilibili.com/x/space/wbi/acc/info"
@@ -55,6 +62,10 @@ object BiliApiEndpoints {
         Descriptor("PLAYURL_WBI", "GET", PLAYURL_WBI, requiresLogin = false, requiresWbi = true, requiresCsrf = false, trust = Trust.VERIFIED_FROM_REFERENCE),
         Descriptor("QR_GENERATE", "GET", QR_GENERATE, requiresLogin = false, requiresWbi = false, requiresCsrf = false, trust = Trust.OFFICIAL_WEB_PASSPORT),
         Descriptor("QR_POLL", "GET", QR_POLL, requiresLogin = false, requiresWbi = false, requiresCsrf = false, trust = Trust.OFFICIAL_WEB_PASSPORT),
+        Descriptor("LOGIN_CAPTCHA", "GET", LOGIN_CAPTCHA, requiresLogin = false, requiresWbi = false, requiresCsrf = false, trust = Trust.OFFICIAL_WEB_PASSPORT),
+        Descriptor("SMS_SEND", "POST", SMS_SEND, requiresLogin = false, requiresWbi = false, requiresCsrf = false, trust = Trust.OFFICIAL_WEB_PASSPORT),
+        Descriptor("SMS_LOGIN", "POST", SMS_LOGIN, requiresLogin = false, requiresWbi = false, requiresCsrf = false, trust = Trust.OFFICIAL_WEB_PASSPORT),
+        Descriptor("COUNTRY_LIST", "GET", COUNTRY_LIST, requiresLogin = false, requiresWbi = false, requiresCsrf = false, trust = Trust.OFFICIAL_WEB_PASSPORT),
         Descriptor("USER_CARD", "GET", USER_CARD, requiresLogin = false, requiresWbi = false, requiresCsrf = false, trust = Trust.UNVERIFIED),
         Descriptor("SPACE_ACC_INFO", "GET", SPACE_ACC_INFO, requiresLogin = false, requiresWbi = true, requiresCsrf = false, trust = Trust.UNVERIFIED),
         Descriptor("USER_SEARCH", "GET", USER_SEARCH, requiresLogin = false, requiresWbi = true, requiresCsrf = false, trust = Trust.UNVERIFIED),

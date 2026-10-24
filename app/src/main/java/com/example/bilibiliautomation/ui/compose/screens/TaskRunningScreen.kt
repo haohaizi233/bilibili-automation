@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -39,6 +40,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.tooling.preview.Devices
@@ -91,6 +93,10 @@ data class TaskRunningUiState(
     val skipped: Int,
     val failed: Int,
     val paused: Boolean = false,
+    val groupId: Long? = null,
+    val groupName: String = "",
+    val groupIndex: Int = 0,
+    val groupSize: Int = 0,
 )
 
 @Composable
@@ -104,6 +110,10 @@ fun TaskRunningScreen(
     onSelectAccount: (Long) -> Unit = {},
     onNeedLogin: () -> Unit = {},
     switchableAccounts: List<AccountItem> = emptyList(),
+    switchableTargets: List<TargetItem> = emptyList(),
+    switchableGroups: List<TaskGroupItem> = emptyList(),
+    onSelectTarget: (String) -> Unit = {},
+    onSelectGroup: (Long) -> Unit = {},
     onStart: () -> Unit = {},
     upPainter: Painter? = null,
     accountPainter: Painter? = null,
@@ -142,7 +152,14 @@ fun TaskRunningScreen(
                     .verticalScroll(rememberScrollState()),
             ) {
                 Spacer(Modifier.height(htmlDp(8)))
-                CurrentTaskCard(state, upPainter)
+                CurrentTaskCard(
+                    state = state,
+                    painter = upPainter,
+                    switchableTargets = switchableTargets,
+                    switchableGroups = switchableGroups,
+                    onSelectTarget = onSelectTarget,
+                    onSelectGroup = onSelectGroup,
+                )
                 CurrentVideoCard(state, videoPainter)
                 CurrentAccountCard(
                     state = state,
@@ -236,10 +253,55 @@ private fun IdleTaskState(onStart: () -> Unit, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun CurrentTaskCard(state: TaskRunningUiState, painter: Painter?) {
+private fun CurrentTaskCard(
+    state: TaskRunningUiState,
+    painter: Painter?,
+    switchableTargets: List<TargetItem> = emptyList(),
+    switchableGroups: List<TaskGroupItem> = emptyList(),
+    onSelectTarget: (String) -> Unit = {},
+    onSelectGroup: (Long) -> Unit = {},
+) {
+    var menuExpanded by remember { mutableStateOf(false) }
+    val inGroup = state.groupId != null && state.groupSize > 0
     BiliCard(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(horizontal = htmlDp(25), vertical = htmlDp(24))) {
-            Text("当前任务", color = Color(BiliColors.NAVY), fontSize = htmlSp(27), fontWeight = FontWeight.Black)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("当前任务", color = Color(BiliColors.NAVY), fontSize = htmlSp(27), fontWeight = FontWeight.Black, modifier = Modifier.weight(1f))
+                Box {
+                    Box(
+                        modifier = Modifier
+                            .height(htmlDp(40))
+                            .background(Color(0xFFF1F5F9), RoundedCornerShape(htmlDp(11)))
+                            .clickableNoRipple { menuExpanded = true }
+                            .padding(horizontal = htmlDp(18)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text("切换", color = Color(0xFF5B6F8C), fontSize = htmlSp(21), fontWeight = FontWeight.Bold)
+                    }
+                    ScopeSwitchMenu(
+                        expanded = menuExpanded,
+                        onDismiss = { menuExpanded = false },
+                        groups = switchableGroups,
+                        targets = switchableTargets,
+                        selectedGroupId = state.groupId,
+                        selectedTargetUid = state.upUid,
+                        onSelectGroup = onSelectGroup,
+                        onSelectTarget = onSelectTarget,
+                    )
+                }
+            }
+            if (inGroup) {
+                Text(
+                    "任务组 ${state.groupName}  ·  UP ${state.groupIndex + 1}/${state.groupSize}",
+                    color = Color(BiliColors.PINK),
+                    fontSize = htmlSp(20),
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(top = htmlDp(12)),
+                )
+            }
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -388,7 +450,11 @@ private fun CurrentAccountCard(
     state: TaskRunningUiState,
     painter: Painter?,
     switchableAccounts: List<AccountItem> = emptyList(),
+    switchableTargets: List<TargetItem> = emptyList(),
+    switchableGroups: List<TaskGroupItem> = emptyList(),
     onSelectAccount: (Long) -> Unit = {},
+    onSelectTarget: (String) -> Unit = {},
+    onSelectGroup: (Long) -> Unit = {},
     onNeedLogin: () -> Unit = {},
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
@@ -430,6 +496,8 @@ private fun CurrentAccountCard(
                     DropdownMenu(
                         expanded = menuExpanded,
                         onDismissRequest = { menuExpanded = false },
+                        modifier = Modifier.heightIn(max = (LocalConfiguration.current.screenHeightDp * 0.45f).dp),
+                        scrollState = rememberScrollState(),
                     ) {
                         switchableAccounts.forEach { item ->
                             val selected = item.id == state.accountId
@@ -511,6 +579,74 @@ private fun CurrentStatsCard(state: TaskRunningUiState) {
                 MetricCell("已跳过", state.skipped.toString(), Color(BiliColors.METRIC_NEUTRAL), Modifier.weight(1f))
                 MetricCell("失败", state.failed.toString(), Color(BiliColors.METRIC_PINK), Modifier.weight(1f))
             }
+        }
+    }
+}
+
+@Composable
+fun ScopeSwitchMenu(
+    expanded: Boolean,
+    onDismiss: () -> Unit,
+    groups: List<TaskGroupItem>,
+    targets: List<TargetItem>,
+    selectedGroupId: Long?,
+    selectedTargetUid: String?,
+    onSelectGroup: (Long) -> Unit,
+    onSelectTarget: (String) -> Unit,
+) {
+    val maxHeight = (LocalConfiguration.current.screenHeightDp * 0.45f).dp
+    DropdownMenu(
+        expanded = expanded,
+        onDismissRequest = onDismiss,
+        modifier = Modifier.heightIn(max = maxHeight),
+        scrollState = rememberScrollState(),
+    ) {
+        if (groups.isNotEmpty()) {
+            DropdownMenuItem(
+                text = { Text("任务组", color = Color(0xFF8C9BB0), fontWeight = FontWeight.Bold) },
+                onClick = {},
+                enabled = false,
+            )
+            groups.forEach { group ->
+                val selected = group.id == selectedGroupId
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            if (selected) "${group.name}（当前）" else "${group.name} · ${group.members.size} UP",
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                        )
+                    },
+                    onClick = {
+                        onDismiss()
+                        if (!selected) onSelectGroup(group.id)
+                    },
+                )
+            }
+        }
+        if (targets.isNotEmpty()) {
+            DropdownMenuItem(
+                text = { Text("单个 UP", color = Color(0xFF8C9BB0), fontWeight = FontWeight.Bold) },
+                onClick = {},
+                enabled = false,
+            )
+            targets.forEach { item ->
+                val selected = selectedGroupId == null && item.uid == selectedTargetUid
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            if (selected) "${item.name}（当前）" else item.name,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                        )
+                    },
+                    onClick = {
+                        onDismiss()
+                        if (!selected) onSelectTarget(item.uid)
+                    },
+                )
+            }
+        }
+        if (groups.isEmpty() && targets.isEmpty()) {
+            DropdownMenuItem(text = { Text("还没有目标 UP") }, onClick = onDismiss)
         }
     }
 }

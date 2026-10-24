@@ -52,7 +52,7 @@ class WebViewManager(
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 pageState = PageState.LOADING
                 currentUrl = url.orEmpty()
-                logger.i("onPageStarted url=$currentUrl")
+                logger.d("onPageStarted url=$currentUrl")
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
@@ -61,8 +61,21 @@ class WebViewManager(
                 if (pageState != PageState.FAILED) {
                     pageState = PageState.READY
                 }
-                logger.i("onPageFinished url=$currentUrl title=$pageTitle state=$pageState")
+                logger.d("onPageFinished url=$currentUrl title=$pageTitle state=$pageState")
                 completeNavigation(pageState != PageState.FAILED)
+            }
+
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val uri = request?.url ?: return true
+                val scheme = uri.scheme?.lowercase().orEmpty()
+                val allowed = scheme == "https" ||
+                    scheme == "about" ||
+                    (config.debugEnabled && scheme == "file")
+                if (!allowed) {
+                    logger.w("blocked navigation scheme=$scheme url=$uri")
+                    return true
+                }
+                return false
             }
 
             override fun onReceivedError(
@@ -152,17 +165,30 @@ class WebViewManager(
     }
 
     fun applySettings() {
-        webView.settings.javaScriptEnabled = config.javaScriptEnabled
-        webView.settings.domStorageEnabled = config.domStorageEnabled
-        webView.settings.useWideViewPort = true
-        webView.settings.loadWithOverviewMode = true
-        webView.settings.builtInZoomControls = true
-        webView.settings.displayZoomControls = false
+        val settings = webView.settings
+        settings.javaScriptEnabled = config.javaScriptEnabled
+        settings.domStorageEnabled = config.domStorageEnabled
+        settings.useWideViewPort = true
+        settings.loadWithOverviewMode = true
+        settings.builtInZoomControls = true
+        settings.displayZoomControls = false
+        settings.allowFileAccess = config.debugEnabled
+        settings.allowContentAccess = false
+        @Suppress("DEPRECATION")
+        settings.allowFileAccessFromFileURLs = false
+        @Suppress("DEPRECATION")
+        settings.allowUniversalAccessFromFileURLs = false
+        settings.mediaPlaybackRequiresUserGesture = true
+        settings.setGeolocationEnabled(false)
+        settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
+        if (Build.VERSION.SDK_INT >= 26) {
+            settings.safeBrowsingEnabled = true
+        }
         val ua = config.userAgent
         if (!ua.isNullOrBlank()) {
-            webView.settings.userAgentString = ua
+            settings.userAgentString = ua
         }
-        logger.i(
+        logger.d(
             "WebView settings js=${config.javaScriptEnabled} domStorage=${config.domStorageEnabled} " +
                 "debug=${config.debugEnabled}",
         )

@@ -31,6 +31,23 @@ data class QrPollData(
     val redirectUrl: String?,
 )
 
+data class LoginCaptcha(
+    val type: String,
+    val token: String,
+    val gt: String,
+    val challenge: String,
+)
+
+data class SmsSendResult(
+    val captchaKey: String,
+)
+
+data class SmsCountry(
+    val cid: Int,
+    val name: String,
+    val countryId: String,
+)
+
 data class VideoItem(
     val aid: Long,
     val bvid: String,

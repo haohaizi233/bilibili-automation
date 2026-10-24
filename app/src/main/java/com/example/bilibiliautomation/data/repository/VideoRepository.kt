@@ -38,6 +38,10 @@ class VideoRepository(
             dao.markProcessed(bvid, true, now, commentCount, cursor, now)
         }
 
+    suspend fun deleteAll() = withContext(Dispatchers.IO) {
+        dao.deleteAll()
+    }
+
     private fun VideoEntity.toModel() = Video(
         bvid = bvid,
         targetUid = targetUid,

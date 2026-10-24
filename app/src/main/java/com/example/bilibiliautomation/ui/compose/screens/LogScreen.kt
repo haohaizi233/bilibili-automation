@@ -38,6 +38,8 @@ import androidx.compose.ui.unit.sp
 import com.example.bilibiliautomation.ui.compose.components.BiliCard
 import com.example.bilibiliautomation.ui.compose.components.BottomNav
 import com.example.bilibiliautomation.ui.compose.components.BiliTab
+import com.example.bilibiliautomation.ui.compose.components.EmptyArt
+import com.example.bilibiliautomation.ui.compose.components.EmptyHint
 import com.example.bilibiliautomation.ui.compose.components.StatusBar
 import com.example.bilibiliautomation.ui.compose.components.TopHeader
 import com.example.bilibiliautomation.ui.compose.components.clickableNoRipple
@@ -97,17 +99,26 @@ fun LogScreen(
             },
         )
         FilterRow(selected = selectedFilter, onSelect = onFilterSelect)
-        BiliCard(modifier = Modifier.fillMaxWidth().padding(horizontal = htmlDp(38), vertical = htmlDp(8))) {
-            LazyColumn(modifier = Modifier.padding(horizontal = htmlDp(16), vertical = htmlDp(10))) {
-                items(rows) { entry ->
-                    LogRow(entry)
-                    if (rows.indexOf(entry) < rows.lastIndex) {
-                        Box(Modifier.fillMaxWidth().height(htmlDp(1)).background(Color(0xFFE3E9EF)))
+        if (rows.isEmpty()) {
+            EmptyHint(
+                art = EmptyArt.LOG,
+                title = "还没有任务日志",
+                subtitle = "开始任务后，浏览视频、关注和跳过都会记在这里，方便你随时回看。",
+                modifier = Modifier.weight(1f),
+            )
+        } else {
+            BiliCard(modifier = Modifier.fillMaxWidth().padding(horizontal = htmlDp(38), vertical = htmlDp(8))) {
+                LazyColumn(modifier = Modifier.padding(horizontal = htmlDp(16), vertical = htmlDp(10))) {
+                    items(rows) { entry ->
+                        LogRow(entry)
+                        if (rows.indexOf(entry) < rows.lastIndex) {
+                            Box(Modifier.fillMaxWidth().height(htmlDp(1)).background(Color(0xFFE3E9EF)))
+                        }
                     }
                 }
             }
+            Spacer(Modifier.weight(1f))
         }
-        Spacer(Modifier.weight(1f))
         BottomNav(selected = selectedTab, onSelect = onTabSelect)
     }
 }
@@ -204,5 +215,13 @@ private fun LogScreenPreview() {
     var selectedTab by remember { mutableStateOf(BiliTab.TASK) }
     BiliTheme {
         LogScreen(selectedTab = selectedTab, onTabSelect = { selectedTab = it }, onBack = {}, onClear = {})
+    }
+}
+
+@Preview(name = "09 任务日志 · 空", showBackground = true, device = Devices.PIXEL_7)
+@Composable
+private fun LogScreenEmptyPreview() {
+    BiliTheme {
+        LogScreen(onTabSelect = {}, logs = emptyList())
     }
 }

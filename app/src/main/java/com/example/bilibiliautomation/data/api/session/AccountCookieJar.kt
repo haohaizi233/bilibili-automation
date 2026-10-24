@@ -38,6 +38,20 @@ class AccountCookieJar(
         logMutation("clear", 0)
     }
 
+    @Synchronized
+    fun merge(cookies: List<SessionCookie>) {
+        if (cookies.isEmpty()) return
+        cookies.forEach { incoming ->
+            stored.removeAll { existing ->
+                existing.name.equals(incoming.name, ignoreCase = true) &&
+                    existing.domain.equals(incoming.domain, ignoreCase = true) &&
+                    existing.path == incoming.path
+            }
+            stored.add(incoming)
+        }
+        logMutation("merge", stored.size)
+    }
+
     val csrf: String?
         get() = snapshot().firstOrNull { it.name.equals("bili_jct", ignoreCase = true) }?.value
 
@@ -69,8 +83,7 @@ class AccountCookieJar(
     }
 
     private fun logMutation(op: String, count: Int) {
-        val names = snapshot().joinToString(",") { it.name }
-        logger.i("cookieJar accountId=$accountId op=$op cookieCount=$count cookieNames=$names")
+        logger.d("cookieJar accountId=$accountId op=$op cookieCount=$count")
     }
 
     private fun Cookie.toStored(): SessionCookie = SessionCookie(
@@ -106,6 +119,7 @@ class AccountCookieJar(
 
     private fun domainMatches(host: String, cookieDomain: String): Boolean {
         val normalized = cookieDomain.removePrefix(".").lowercase()
+        if (normalized.isBlank() || !normalized.contains('.')) return false
         val h = host.lowercase()
         return h == normalized || h.endsWith(".$normalized")
     }

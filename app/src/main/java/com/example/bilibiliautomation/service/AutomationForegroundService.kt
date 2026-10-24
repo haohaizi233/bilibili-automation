@@ -14,7 +14,6 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.example.bilibiliautomation.AutomationApplication
 import com.example.bilibiliautomation.MainActivity
-import com.example.bilibiliautomation.R
 import com.example.bilibiliautomation.logging.AutomationLogger
 import com.example.bilibiliautomation.ui.task.TaskUiState
 import kotlinx.coroutines.CoroutineScope
@@ -53,22 +52,29 @@ class AutomationForegroundService : Service() {
                     scheduler.start(target, accountId)
                 }
             }
+            ACTION_ATTACH -> { /* keep the foreground notification without restarting the task */ }
             ACTION_RESUME -> {
                 val taskId = intent.getLongExtra(EXTRA_TASK_ID, -1L)
                 if (taskId > 0) scheduler.resume(taskId)
             }
         }
         val notification = buildNotification(scheduler.uiState.value)
-        ServiceCompat.startForeground(
-            this,
-            NOTIFICATION_ID,
-            notification,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            } else {
-                0
-            },
-        )
+        try {
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                notification,
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                } else {
+                    0
+                },
+            )
+        } catch (error: Exception) {
+            AutomationLogger.e("startForeground failed", error)
+            stopSelf()
+            return START_NOT_STICKY
+        }
         if (collectJob == null) {
             collectJob = scope.launch {
                 scheduler.uiState.collect { state ->
@@ -88,33 +94,39 @@ class AutomationForegroundService : Service() {
     }
 
     private fun buildNotification(state: TaskUiState): Notification {
+        val launch = packageManager.getLaunchIntentForPackage(packageName)
+            ?: Intent(this, MainActivity::class.java)
         val open = PendingIntent.getActivity(
             this,
             0,
-            Intent(this, MainActivity::class.java),
+            launch,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val pause = pendingService(ACTION_PAUSE, 1)
         val stop = pendingService(ACTION_STOP, 2)
-        val progress = "${state.videoProgress.label} videos, ${state.commentProgress.label} comments"
+        val statusLabel = when (state.status) {
+            com.example.bilibiliautomation.domain.model.TaskStatus.RUNNING -> "运行中"
+            com.example.bilibiliautomation.domain.model.TaskStatus.PAUSED -> "已暂停"
+            com.example.bilibiliautomation.domain.model.TaskStatus.INTERRUPTED -> "已中断"
+            com.example.bilibiliautomation.domain.model.TaskStatus.FINISHED -> "已完成"
+            com.example.bilibiliautomation.domain.model.TaskStatus.FAILED -> "失败"
+            com.example.bilibiliautomation.domain.model.TaskStatus.CANCELLED -> "已取消"
+            com.example.bilibiliautomation.domain.model.TaskStatus.COOLDOWN -> "冷却中"
+            com.example.bilibiliautomation.domain.model.TaskStatus.QUEUED -> "排队中"
+            com.example.bilibiliautomation.domain.model.TaskStatus.IDLE -> "待命"
+        }
+        val action = state.currentAction?.takeIf { it.isNotBlank() } ?: "保持前台运行"
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle("Automation ${state.status}")
-            .setContentText("task=${state.taskId ?: "-"} target=${state.target?.uid ?: "-"} $progress")
-            .setStyle(
-                NotificationCompat.BigTextStyle().bigText(
-                    "task=${state.taskId ?: "-"}\n" +
-                        "target=${state.target?.uid ?: "-"}\n" +
-                        "state=${state.workflowState}\n" +
-                        "action=${state.currentAction ?: "-"}\n" +
-                        progress,
-                ),
-            )
+            .setContentTitle("任务$statusLabel")
+            .setContentText(action)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(action))
             .setContentIntent(open)
-            .addAction(android.R.drawable.ic_media_pause, "Pause", pause)
-            .addAction(android.R.drawable.ic_delete, "Stop", stop)
+            .addAction(android.R.drawable.ic_media_pause, "暂停", pause)
+            .addAction(android.R.drawable.ic_delete, "停止", stop)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
             .build()
     }
 
@@ -142,6 +154,7 @@ class AutomationForegroundService : Service() {
         const val CHANNEL_ID = "automation_foreground"
         const val NOTIFICATION_ID = 42
         const val ACTION_START = "com.example.bilibiliautomation.START"
+        const val ACTION_ATTACH = "com.example.bilibiliautomation.ATTACH"
         const val ACTION_PAUSE = "com.example.bilibiliautomation.PAUSE"
         const val ACTION_STOP = "com.example.bilibiliautomation.STOP"
         const val ACTION_RESUME = "com.example.bilibiliautomation.RESUME"
@@ -150,10 +163,23 @@ class AutomationForegroundService : Service() {
         const val EXTRA_TASK_ID = "taskId"
 
         fun start(context: Context, targetUid: String, accountId: Long) {
+            if (!com.example.bilibiliautomation.util.KeepAlivePermissions.notificationsGranted(context)) {
+                AutomationLogger.w("skip FGS start — notifications not granted")
+                return
+            }
             val intent = Intent(context, AutomationForegroundService::class.java)
                 .setAction(ACTION_START)
                 .putExtra(EXTRA_TARGET_UID, targetUid)
                 .putExtra(EXTRA_ACCOUNT_ID, accountId)
+            context.startForegroundService(intent)
+        }
+
+        fun attach(context: Context) {
+            if (!com.example.bilibiliautomation.util.KeepAlivePermissions.notificationsGranted(context)) {
+                AutomationLogger.w("skip FGS attach — notifications not granted")
+                return
+            }
+            val intent = Intent(context, AutomationForegroundService::class.java).setAction(ACTION_ATTACH)
             context.startForegroundService(intent)
         }
 

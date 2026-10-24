@@ -36,6 +36,10 @@ class CommentRepository(
         dao.markProcessed(commentId, TimeMs.wallClock())
     }
 
+    suspend fun deleteAll() = withContext(Dispatchers.IO) {
+        dao.deleteAll()
+    }
+
     private fun CommentEntity.toModel() = Comment(
         commentId = commentId,
         videoId = videoId,

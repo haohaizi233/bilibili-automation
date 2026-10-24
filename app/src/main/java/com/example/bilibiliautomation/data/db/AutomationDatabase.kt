@@ -13,6 +13,7 @@ import com.example.bilibiliautomation.data.db.dao.ActionHistoryDao
 import com.example.bilibiliautomation.data.db.dao.CommentDao
 import com.example.bilibiliautomation.data.db.dao.TargetDao
 import com.example.bilibiliautomation.data.db.dao.TaskDao
+import com.example.bilibiliautomation.data.db.dao.TaskGroupDao
 import com.example.bilibiliautomation.data.db.dao.UserDao
 import com.example.bilibiliautomation.data.db.dao.VideoDao
 import com.example.bilibiliautomation.data.db.entity.AccountEntity
@@ -21,6 +22,8 @@ import com.example.bilibiliautomation.data.db.entity.CommentEntity
 import com.example.bilibiliautomation.data.db.entity.TargetEntity
 import com.example.bilibiliautomation.data.db.entity.TaskCheckpointEntity
 import com.example.bilibiliautomation.data.db.entity.TaskEntity
+import com.example.bilibiliautomation.data.db.entity.TaskGroupEntity
+import com.example.bilibiliautomation.data.db.entity.TaskGroupMemberEntity
 import com.example.bilibiliautomation.data.db.entity.UserEntity
 import com.example.bilibiliautomation.data.db.entity.VideoEntity
 
@@ -34,8 +37,10 @@ import com.example.bilibiliautomation.data.db.entity.VideoEntity
         ActionHistoryEntity::class,
         TaskEntity::class,
         TaskCheckpointEntity::class,
+        TaskGroupEntity::class,
+        TaskGroupMemberEntity::class,
     ],
-    version = 4,
+    version = 5,
     exportSchema = true,
 )
 @TypeConverters(DbConverters::class)
@@ -48,6 +53,7 @@ abstract class AutomationDatabase : RoomDatabase() {
     abstract fun userDao(): UserDao
     abstract fun actionHistoryDao(): ActionHistoryDao
     abstract fun taskDao(): TaskDao
+    abstract fun taskGroupDao(): TaskGroupDao
 
     companion object {
         const val NAME = "automation.db"
@@ -81,7 +87,39 @@ abstract class AutomationDatabase : RoomDatabase() {
             }
         }
 
-        val ALL_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE tasks ADD COLUMN groupId INTEGER")
+                db.execSQL("ALTER TABLE tasks ADD COLUMN groupIndex INTEGER NOT NULL DEFAULT 0")
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS task_groups (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                      name TEXT NOT NULL,
+                      createdAt INTEGER NOT NULL,
+                      updatedAt INTEGER NOT NULL
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_task_groups_updatedAt ON task_groups(updatedAt)")
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS task_group_members (
+                      groupId INTEGER NOT NULL,
+                      targetUid TEXT NOT NULL,
+                      sortOrder INTEGER NOT NULL,
+                      createdAt INTEGER NOT NULL,
+                      PRIMARY KEY(groupId, targetUid),
+                      FOREIGN KEY(groupId) REFERENCES task_groups(id) ON DELETE CASCADE
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_task_group_members_groupId ON task_group_members(groupId)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_task_group_members_targetUid ON task_group_members(targetUid)")
+            }
+        }
+
+        val ALL_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
 
         fun create(context: Context): AutomationDatabase {
             return Room.databaseBuilder(context, AutomationDatabase::class.java, NAME)

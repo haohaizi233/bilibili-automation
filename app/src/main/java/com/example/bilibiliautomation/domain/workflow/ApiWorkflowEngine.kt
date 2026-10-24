@@ -12,7 +12,9 @@ import com.example.bilibiliautomation.domain.api.ApiError
 import com.example.bilibiliautomation.domain.api.ApiResult
 import com.example.bilibiliautomation.domain.api.RelationState
 import com.example.bilibiliautomation.domain.api.SessionState
+import com.example.bilibiliautomation.domain.model.Account
 import com.example.bilibiliautomation.domain.model.AccountStatus
+import com.example.bilibiliautomation.domain.model.AppSettings
 import com.example.bilibiliautomation.domain.model.AutomationResult
 import com.example.bilibiliautomation.domain.model.LoadedComment
 import com.example.bilibiliautomation.domain.model.LoadedVideo
@@ -46,13 +48,13 @@ class ApiWorkflowEngine(
     private val accountManager: AccountManager,
     private val accountPool: AccountPool,
     private val rateLimiter: RateLimiter,
+    private val settings: () -> AppSettings = { AppSettings() },
     private val eventBus: AutomationEventBus,
     private val logger: AutomationLogger = AutomationLogger,
     val dryRun: Boolean = BuildConfig.DEBUG,
     private val maxVideoPages: Int = 20,
     private val commentPageSize: Int = 20,
     private val maxCommentPages: Int = 10,
-    private val maxRetries: Int = 3,
     private val rateLimiterCooldownMs: Long = 2_000L,
 ) : RunnableWorkflow {
     private val _state = MutableStateFlow(WorkflowState.IDLE)
@@ -63,6 +65,14 @@ class ApiWorkflowEngine(
 
     @Volatile
     override var cancelRequested: Boolean = false
+
+    private fun cooldownMinutes(): Int = settings().cooldownMinutes.coerceAtLeast(1)
+
+    private val maxRetries: Int
+        get() {
+            val cfg = settings()
+            return if (cfg.autoRetry) cfg.retryCount.coerceIn(0, 10) else 0
+        }
 
     override suspend fun run(
         task: Task,
@@ -162,6 +172,9 @@ class ApiWorkflowEngine(
     private suspend fun stepValidate(task: Task, ctx: WorkflowContext): WorkflowState {
         val accountId = ctx.currentAccountId ?: accountPool.pick()?.also { ctx.currentAccountId = it.id }?.id
         if (accountId == null) {
+            if (settings().unattendedMode && awaitIdleAccount(task, ctx, null)) {
+                return WorkflowState.VALIDATE_ACCOUNT
+            }
             logger.w("NeedLogin — no valid account in pool")
             return WorkflowState.PAUSED
         }
@@ -170,13 +183,19 @@ class ApiWorkflowEngine(
                 is SessionState.Valid -> WorkflowState.OPEN_TARGET
                 SessionState.Expired, SessionState.NotLoggedIn -> {
                     accountManager.markLoginRequired(accountId, result.value.toString(), "session invalid")
-                    eventBus.emit(AutomationEvent.TaskPaused(task.id, "login invalid"))
-                    WorkflowState.PAUSED
+                    if (rotateToNextAccount(task, ctx, accountId)) WorkflowState.VALIDATE_ACCOUNT
+                    else {
+                        eventBus.emit(AutomationEvent.TaskPaused(task.id, "login invalid"))
+                        WorkflowState.PAUSED
+                    }
                 }
                 SessionState.RiskControlled -> {
-                    accountManager.markCooldown(accountId, ResultCode.ACCOUNT_RESTRICTED, "risk", 30)
-                    eventBus.emit(AutomationEvent.TaskPaused(task.id, "risk control"))
-                    WorkflowState.PAUSED
+                    accountManager.markCooldown(accountId, ResultCode.ACCOUNT_RESTRICTED, "risk", cooldownMinutes())
+                    if (rotateToNextAccount(task, ctx, accountId)) WorkflowState.VALIDATE_ACCOUNT
+                    else {
+                        eventBus.emit(AutomationEvent.TaskPaused(task.id, "risk control"))
+                        WorkflowState.PAUSED
+                    }
                 }
                 is SessionState.NetworkError, is SessionState.UnknownError -> WorkflowState.PAUSED
             }
@@ -317,7 +336,7 @@ class ApiWorkflowEngine(
         val target = task.targetUid.orEmpty()
         if (processedUsers.hasProcessed(target, comment.userUid)) {
             logger.i("skip duplicate uid=${comment.userUid}")
-            eventBus.emit(AutomationEvent.ActionCompleted(task.id, "SKIP", ResultCode.SKIPPED, "already processed"))
+            recordSkip(task, ctx, comment.userUid, "already processed")
             return WorkflowState.NEXT_COMMENT
         }
         ctx.currentUserUid = comment.userUid
@@ -339,12 +358,12 @@ class ApiWorkflowEngine(
                 )
                 if (state.isFollowing) {
                     logger.i("skip already following uid=$uid state=$state")
-                    eventBus.emit(AutomationEvent.ActionCompleted(task.id, "SKIP", ResultCode.SKIPPED, "already following"))
+                    recordSkip(task, ctx, uid.toString(), "already following")
                     WorkflowState.NEXT_COMMENT
                 } else when (state) {
                     RelationState.Unknown -> {
                         logger.log(LogLevel.WARN, "UNKNOWN relation — SKIP uid=$uid", action = "checkRelationship")
-                        eventBus.emit(AutomationEvent.ActionCompleted(task.id, "SKIP", ResultCode.SKIPPED, "unknown relation"))
+                        recordSkip(task, ctx, uid.toString(), "unknown relation")
                         WorkflowState.NEXT_COMMENT
                     }
                     RelationState.None, RelationState.Follower -> WorkflowState.PERFORM_ACTION
@@ -357,9 +376,15 @@ class ApiWorkflowEngine(
     private suspend fun stepPerformAction(task: Task, ctx: WorkflowContext): WorkflowState {
         val uid = ctx.currentUserUid?.toLongOrNull() ?: return WorkflowState.NEXT_COMMENT
         val accountId = ctx.currentAccountId ?: return WorkflowState.PAUSED
-        if (!rateLimiter.underDailyLimit()) {
-            logger.w("daily limit reached accountId=$accountId")
-            return WorkflowState.COOLDOWN
+        val usedToday = actionRepository.countFollowAttemptsToday(accountId.toString())
+        if (!rateLimiter.underDailyLimit(usedToday)) {
+            logger.w("daily limit reached accountId=$accountId usedToday=$usedToday")
+            val waitMinutes = ((TimeMs.nextBeijingDayStart() - TimeMs.wallClock()) / 60_000L)
+                .toInt()
+                .coerceAtLeast(1)
+            accountManager.markCooldown(accountId, ResultCode.RATE_LIMITED, "daily limit", waitMinutes)
+            return if (rotateToNextAccount(task, ctx, accountId)) WorkflowState.VALIDATE_ACCOUNT
+            else WorkflowState.COOLDOWN
         }
         rateLimiter.awaitSlot()
         eventBus.emit(AutomationEvent.ActionStarted(task.id, "FOLLOW"))
@@ -393,7 +418,6 @@ class ApiWorkflowEngine(
             resultCode = code,
             resultMessage = result.errorOrNull()?.message,
         )
-        rateLimiter.recordAction()
         return when (val error = result.errorOrNull()) {
             null -> WorkflowState.NEXT_COMMENT
             else -> mapError(task, ctx, error)
@@ -423,6 +447,23 @@ class ApiWorkflowEngine(
         return last
     }
 
+    private suspend fun recordSkip(task: Task, ctx: WorkflowContext, targetUid: String, reason: String) {
+        ctx.skipped += 1
+        eventBus.emit(AutomationEvent.ActionCompleted(task.id, "SKIP", ResultCode.SKIPPED, reason))
+        actionRepository.record(
+            accountUid = ctx.currentAccountId?.toString().orEmpty(),
+            targetUid = targetUid,
+            sourceTargetUid = task.targetUid,
+            sourceVideoId = ctx.videos.getOrNull(ctx.videoIndex)?.bvid,
+            sourceCommentId = ctx.comments.getOrNull(ctx.commentIndex)?.commentId,
+            actionType = "SKIP",
+            beforeState = null,
+            afterState = ResultCode.SKIPPED,
+            resultCode = ResultCode.SKIPPED,
+            resultMessage = reason,
+        )
+    }
+
     private fun stepNextComment(ctx: WorkflowContext): WorkflowState {
         ctx.commentIndex += 1
         return if (ctx.commentIndex < ctx.comments.size) WorkflowState.PROCESS_COMMENT
@@ -441,9 +482,15 @@ class ApiWorkflowEngine(
         return when (error) {
             is ApiError.RateLimited -> {
                 rateLimiter.triggerCooldown()
-                task.accountId?.let { accountManager.markCooldown(it, ResultCode.RATE_LIMITED, error.message, 30) }
-                eventBus.emit(AutomationEvent.NeedsReview(task.id, task.accountId, ResultCode.RATE_LIMITED, error.message))
-                WorkflowState.COOLDOWN
+                (ctx.currentAccountId ?: task.accountId)?.let {
+                    accountManager.markCooldown(it, ResultCode.RATE_LIMITED, error.message, cooldownMinutes())
+                }
+                if (rotateToNextAccount(task, ctx, ctx.currentAccountId ?: task.accountId)) {
+                    WorkflowState.VALIDATE_ACCOUNT
+                } else {
+                    eventBus.emit(AutomationEvent.NeedsReview(task.id, task.accountId, ResultCode.RATE_LIMITED, error.message))
+                    WorkflowState.COOLDOWN
+                }
             }
             is ApiError.SessionExpired, is ApiError.SessionInvalid -> {
                 val old = ctx.currentAccountId
@@ -454,10 +501,14 @@ class ApiWorkflowEngine(
                 handleSessionOrRisk(task, ctx, old, error)
             }
             is ApiError.AccountRestricted -> {
-                task.accountId?.let {
-                    accountManager.markCooldown(it, ResultCode.ACCOUNT_RESTRICTED, error.message, 30)
+                (ctx.currentAccountId ?: task.accountId)?.let {
+                    accountManager.markCooldown(it, ResultCode.ACCOUNT_RESTRICTED, error.message, cooldownMinutes())
                 }
-                WorkflowState.COOLDOWN
+                if (rotateToNextAccount(task, ctx, ctx.currentAccountId ?: task.accountId)) {
+                    WorkflowState.VALIDATE_ACCOUNT
+                } else {
+                    WorkflowState.COOLDOWN
+                }
             }
             is ApiError.Cancelled -> WorkflowState.PAUSED
             else -> {
@@ -486,10 +537,15 @@ class ApiWorkflowEngine(
             eventBus.emit(AutomationEvent.NeedsReview(task.id, null, "NO_ACCOUNT", error.message))
             return WorkflowState.PAUSED
         }
-        val verdict = backend.validateSession(oldAccountId)
-        val genuinelyExpired = when (verdict) {
-            is ApiResult.Ok -> verdict.value is SessionState.Expired || verdict.value is SessionState.NotLoggedIn
-            is ApiResult.Err -> false
+        val cfg = settings()
+        val genuinelyExpired = if (cfg.smartStatus) {
+            val verdict = backend.validateSession(oldAccountId)
+            when (verdict) {
+                is ApiResult.Ok -> verdict.value is SessionState.Expired || verdict.value is SessionState.NotLoggedIn
+                is ApiResult.Err -> false
+            }
+        } else {
+            error is ApiError.SessionExpired || error is ApiError.SessionInvalid
         }
         return if (genuinelyExpired) {
             logger.i("account $oldAccountId genuinely expired (nav confirmed) → login required")
@@ -501,7 +557,7 @@ class ApiWorkflowEngine(
             }
         } else {
             logger.i("account ${oldAccountId} risk/unconfirmed expiry (nav still valid or risk) → cooldown + rotate")
-            accountManager.markCooldown(oldAccountId, ResultCode.ACCOUNT_RESTRICTED, error.message, 30)
+            accountManager.markCooldown(oldAccountId, ResultCode.ACCOUNT_RESTRICTED, error.message, cooldownMinutes())
             if (rotateToNextAccount(task, ctx, oldAccountId)) WorkflowState.VALIDATE_ACCOUNT
             else {
                 eventBus.emit(AutomationEvent.NeedsReview(task.id, oldAccountId, "RISK", error.message))
@@ -510,19 +566,69 @@ class ApiWorkflowEngine(
         }
     }
 
-    /**
-     * Move the task onto another eligible account from the pool. Returns true
-     * when a replacement was activated (ctx.currentAccountId + the task row are
-     * updated and AccountSwitched emitted); false when the pool is empty.
-     */
-    private suspend fun rotateToNextAccount(task: Task, ctx: WorkflowContext, oldAccountId: Long?): Boolean {
-        val next = accountPool.rotate(oldAccountId) ?: return false
+    private fun canRotateAccounts(): Boolean {
+        val cfg = settings()
+        return cfg.unattendedMode || cfg.autoSwitchAccount
+    }
+
+    private suspend fun bindRotatedAccount(
+        task: Task,
+        ctx: WorkflowContext,
+        oldAccountId: Long?,
+        next: Account,
+    ) {
         ctx.currentAccountId = next.id
         logger.currentAccountId = next.id
         taskRepository.updateAccount(task.id, next.id)
         logger.i("account pool rotated task=${task.id} from=$oldAccountId to=${next.id}")
         eventBus.emit(AutomationEvent.AccountSwitched(task.id, oldAccountId, next.id))
-        return true
+    }
+
+    /**
+     * Move the task onto another eligible account from the pool. Returns true
+     * when a replacement was activated. Unattended mode waits until a cooled-down
+     * account becomes idle again instead of pausing immediately.
+     */
+    private suspend fun rotateToNextAccount(task: Task, ctx: WorkflowContext, oldAccountId: Long?): Boolean {
+        if (!canRotateAccounts()) {
+            logger.i("auto rotate disabled, skip pool rotate from=$oldAccountId")
+            return false
+        }
+        accountPool.rotate(oldAccountId)?.let {
+            bindRotatedAccount(task, ctx, oldAccountId, it)
+            return true
+        }
+        if (!settings().unattendedMode) return false
+        if (!accountPool.hasRecoverable(oldAccountId)) {
+            logger.w("no recoverable account in pool from=$oldAccountId")
+            return false
+        }
+        return awaitIdleAccount(task, ctx, oldAccountId)
+    }
+
+    private suspend fun awaitIdleAccount(
+        task: Task,
+        ctx: WorkflowContext,
+        oldAccountId: Long?,
+    ): Boolean {
+        logger.i("unattended wait for idle account from=$oldAccountId")
+        eventBus.emit(AutomationEvent.ActionStarted(task.id, "等待可用账号"))
+        while (coroutineContext.isActive && !cancelRequested && !pauseRequested) {
+            val wait = accountPool.millisUntilNextIdle(oldAccountId)
+                ?.coerceIn(1_000L, 15_000L)
+                ?: return false
+            delay(wait)
+            coroutineContext.ensureActive()
+            if (cancelRequested || pauseRequested) return false
+            val next = accountPool.pick(oldAccountId) ?: accountPool.pick(null)
+            if (next != null) {
+                bindRotatedAccount(task, ctx, oldAccountId, next)
+                return true
+            }
+            if (!accountPool.hasRecoverable(oldAccountId)) return false
+            eventBus.emit(AutomationEvent.ActionStarted(task.id, "等待可用账号"))
+        }
+        return false
     }
 
     private suspend fun persist(

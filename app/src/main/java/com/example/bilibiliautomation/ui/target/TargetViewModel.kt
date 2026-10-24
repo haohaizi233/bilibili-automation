@@ -6,6 +6,7 @@ import com.example.bilibiliautomation.app.AppContainer
 import com.example.bilibiliautomation.data.api.dto.SpaceUser
 import com.example.bilibiliautomation.domain.api.ApiResult
 import com.example.bilibiliautomation.domain.model.Target
+import com.example.bilibiliautomation.domain.model.TaskGroupDetail
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -17,6 +18,9 @@ class TargetViewModel(
     private val container: AppContainer,
 ) : ViewModel() {
     val targets: StateFlow<List<Target>> = container.targetRepository.observeAll()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    val groups: StateFlow<List<TaskGroupDetail>> = container.taskGroupRepository.observeDetails()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     private val _search = MutableStateFlow(SearchState())
@@ -35,6 +39,26 @@ class TargetViewModel(
 
     fun deleteByUid(uid: String) {
         viewModelScope.launch { container.targetRepository.deleteByUid(uid) }
+    }
+
+    fun createGroup(name: String) {
+        viewModelScope.launch { container.taskGroupRepository.create(name) }
+    }
+
+    fun renameGroup(id: Long, name: String) {
+        viewModelScope.launch { container.taskGroupRepository.rename(id, name) }
+    }
+
+    fun deleteGroup(id: Long) {
+        viewModelScope.launch { container.taskGroupRepository.delete(id) }
+    }
+
+    fun addToGroup(groupId: Long, targetUid: String) {
+        viewModelScope.launch { container.taskGroupRepository.addMember(groupId, targetUid) }
+    }
+
+    fun removeFromGroup(groupId: Long, targetUid: String) {
+        viewModelScope.launch { container.taskGroupRepository.removeMember(groupId, targetUid) }
     }
 
     fun setKeyword(value: String) {
