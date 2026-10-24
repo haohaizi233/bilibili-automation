@@ -30,4 +30,32 @@ class AccountCookieJarTest {
         assertEquals("csrf-token", jar.csrf)
         assertEquals(listOf("bili_jct"), jar.snapshot().map { it.name })
     }
+
+    @Test
+    fun mergeReplacesSameNameDomainPath() {
+        val jar = AccountCookieJar(
+            5L,
+            listOf(SessionCookie("SESSDATA", "old", ".bilibili.com")),
+        )
+        jar.merge(
+            listOf(
+                SessionCookie("SESSDATA", "new", ".bilibili.com"),
+                SessionCookie("bili_jct", "csrf", ".bilibili.com"),
+            ),
+        )
+        val names = jar.snapshot().associate { it.name to it.value }
+        assertEquals("new", names["SESSDATA"])
+        assertEquals("csrf", names["bili_jct"])
+        assertEquals("csrf", jar.csrf)
+    }
+
+    @Test
+    fun rejectsPublicSuffixStyleCookieDomain() {
+        val jar = AccountCookieJar(
+            4L,
+            listOf(SessionCookie("SESSDATA", "secret", "com")),
+        )
+        val url = "https://www.bilibili.com/x/web-interface/nav".toHttpUrl()
+        assertTrue(jar.loadForRequest(url).isEmpty())
+    }
 }

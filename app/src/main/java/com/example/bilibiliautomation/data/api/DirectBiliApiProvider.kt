@@ -1,12 +1,15 @@
 package com.example.bilibiliautomation.data.api
 
 import com.example.bilibiliautomation.data.api.dto.CommentPage
+import com.example.bilibiliautomation.data.api.dto.LoginCaptcha
 import com.example.bilibiliautomation.data.api.dto.NavUser
 import com.example.bilibiliautomation.data.api.dto.QrGenerateData
 import com.example.bilibiliautomation.data.api.dto.QrPollCode
 import com.example.bilibiliautomation.data.api.dto.QrPollData
 import com.example.bilibiliautomation.data.api.dto.RelationSnapshot
 import com.example.bilibiliautomation.data.api.dto.RelationStat
+import com.example.bilibiliautomation.data.api.dto.SmsCountry
+import com.example.bilibiliautomation.data.api.dto.SmsSendResult
 import com.example.bilibiliautomation.data.api.dto.SpaceUser
 import com.example.bilibiliautomation.data.api.dto.VideoItem
 import com.example.bilibiliautomation.data.api.dto.VideoPage
@@ -66,6 +69,115 @@ class DirectBiliApiProvider(
                 logger.i("qr login cookies captured accountId=$accountId cookieCount=${jar.snapshot().size}")
             }
             poll
+        }
+    }
+
+    override suspend fun getLoginCaptcha(accountId: Long): ApiResult<LoginCaptcha> {
+        val jar = sessions.jar(accountId)
+        return when (val result = client.get(jar, BiliApiEndpoints.LOGIN_CAPTCHA, mapOf("source" to "main_web"), "LOGIN_CAPTCHA")) {
+            is ApiResult.Err -> ApiResult.err(result.error)
+            is ApiResult.Ok -> {
+                val parsed = BiliJson.parseLoginCaptcha(result.value.data)
+                if (parsed == null) {
+                    ApiResult.err(ApiError.InvalidResponse("captcha payload missing gt/challenge/token"))
+                } else {
+                    ApiResult.ok(parsed)
+                }
+            }
+        }
+    }
+
+    override suspend fun sendSmsCode(
+        accountId: Long,
+        cid: Int,
+        tel: String,
+        token: String,
+        challenge: String,
+        validate: String,
+        seccode: String,
+    ): ApiResult<SmsSendResult> {
+        val jar = sessions.jar(accountId)
+        val seccodeNorm = if (seccode.contains("jordan")) seccode else "$validate|jordan"
+        return when (
+            val result = client.postForm(
+                jar = jar,
+                url = BiliApiEndpoints.SMS_SEND,
+                fields = mapOf(
+                    "cid" to cid.toString(),
+                    "tel" to tel,
+                    "source" to "main_web",
+                    "token" to token,
+                    "challenge" to challenge,
+                    "validate" to validate,
+                    "seccode" to seccodeNorm,
+                ),
+                logicalName = "SMS_SEND",
+                requireCsrf = false,
+                requireSession = false,
+            )
+        ) {
+            is ApiResult.Err -> ApiResult.err(result.error)
+            is ApiResult.Ok -> {
+                val parsed = BiliJson.parseSmsSend(result.value.data)
+                if (parsed == null) {
+                    ApiResult.err(ApiError.InvalidResponse("sms send missing captcha_key"))
+                } else {
+                    ApiResult.ok(parsed)
+                }
+            }
+        }
+    }
+
+    override suspend fun loginWithSms(
+        accountId: Long,
+        cid: Int,
+        tel: String,
+        code: String,
+        captchaKey: String,
+    ): ApiResult<Unit> {
+        val jar = sessions.jar(accountId)
+        val result = client.postForm(
+            jar = jar,
+            url = BiliApiEndpoints.SMS_LOGIN,
+            fields = mapOf(
+                "cid" to cid.toString(),
+                "tel" to tel,
+                "code" to code,
+                "source" to "main_web",
+                "captcha_key" to captchaKey,
+                "keep" to "true",
+                "go_url" to "https://www.bilibili.com",
+            ),
+            logicalName = "SMS_LOGIN",
+            requireCsrf = false,
+            requireSession = false,
+        )
+        return when (result) {
+            is ApiResult.Err -> ApiResult.err(result.error)
+            is ApiResult.Ok -> {
+                val status = result.value.data?.optInt("status", 0) ?: 0
+                if (status != 0) {
+                    sessions.updateCookies(accountId)
+                    val hint = result.value.data?.optString("message").orEmpty()
+                        .ifBlank { result.value.message }
+                    ApiResult.err(
+                        ApiError.VerificationRequired(
+                            hint.ifBlank { "sms login extra verification" },
+                        ),
+                    )
+                } else {
+                    sessions.updateCookies(accountId)
+                    logger.i("sms login cookies captured accountId=$accountId cookieCount=${jar.snapshot().size}")
+                    ApiResult.ok(Unit)
+                }
+            }
+        }
+    }
+
+    override suspend fun listSmsCountries(accountId: Long): ApiResult<List<SmsCountry>> {
+        val jar = sessions.jar(accountId)
+        return client.get(jar, BiliApiEndpoints.COUNTRY_LIST, emptyMap(), "COUNTRY_LIST").map { envelope ->
+            BiliJson.parseSmsCountries(envelope.data)
         }
     }
 

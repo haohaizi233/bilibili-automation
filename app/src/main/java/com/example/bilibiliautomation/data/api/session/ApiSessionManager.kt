@@ -6,6 +6,7 @@ import com.example.bilibiliautomation.domain.api.SessionState
 import com.example.bilibiliautomation.domain.model.Account
 import com.example.bilibiliautomation.domain.model.AccountSession
 import com.example.bilibiliautomation.domain.model.AccountStatus
+import com.example.bilibiliautomation.domain.model.SessionCookie
 import com.example.bilibiliautomation.logging.AutomationLogger
 import com.example.bilibiliautomation.util.MediaUrls
 import com.example.bilibiliautomation.util.TimeMs
@@ -92,6 +93,13 @@ class ApiSessionManager(
         logger.i("apiSession invalidate accountId=$accountId")
     }
 
+    suspend fun importCookies(accountId: Long, cookies: List<SessionCookie>) {
+        mutex.withLock {
+            jar(accountId).merge(cookies)
+        }
+        updateCookies(accountId)
+    }
+
     suspend fun updateCookies(accountId: Long, uid: Long? = null, uname: String? = null, status: AccountStatus = AccountStatus.ACTIVE) {
         mutex.withLock {
             val jar = jar(accountId)
@@ -111,8 +119,7 @@ class ApiSessionManager(
             sessions[accountId] = session
             persistLocked(accountId, session)
             logger.i(
-                "apiSession updateCookies accountId=$accountId cookieCount=${cookies.size} " +
-                    "cookieNames=${cookies.joinToString(",") { it.name }} status=$status",
+                "apiSession updateCookies accountId=$accountId cookieCount=${cookies.size} status=$status",
             )
         }
     }
