@@ -7,6 +7,7 @@ import com.example.bilibiliautomation.domain.model.Account
 import com.example.bilibiliautomation.domain.model.AccountStatus
 import com.example.bilibiliautomation.domain.model.Target
 import com.example.bilibiliautomation.domain.model.TaskStatus
+import com.example.bilibiliautomation.domain.model.TodayStats
 import com.example.bilibiliautomation.ui.task.TaskUiState
 import com.example.bilibiliautomation.util.TimeMs
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -35,7 +36,8 @@ class HomeViewModel(
         targets,
         task,
         container.sessionManager.currentAccountIdFlow,
-    ) { accountList, targetList, taskState, currentAccountId ->
+        container.actionRepository.observeTodayStats(),
+    ) { accountList, targetList, taskState, currentAccountId, today ->
         // Single source of truth: the user-chosen current account wins.
         // Always resolve the live Account from accountList so the badge
         // reflects the current DB status (e.g. LOGIN_EXPIRED) rather than a
@@ -51,6 +53,7 @@ class HomeViewModel(
             account = selectedAccount,
             target = selectedTarget,
             task = taskState,
+            today = today,
             needLogin = selectedAccount == null ||
                 selectedAccount.status == AccountStatus.LOGIN_REQUIRED ||
                 selectedAccount.status == AccountStatus.LOGIN_EXPIRED,
@@ -72,8 +75,17 @@ class HomeViewModel(
         currentUrl.value = url
     }
 
-    fun start(targetUid: String, accountId: Long) {
-        container.taskScheduler.start(targetUid, accountId)
+    fun start(targetUid: String, accountId: Long, groupId: Long? = null) {
+        container.taskScheduler.start(targetUid, accountId, groupId)
+    }
+
+    fun selectTarget(uid: String) = container.taskScheduler.selectTarget(uid)
+
+    fun selectGroup(groupId: Long, startUid: String? = null) =
+        container.taskScheduler.selectGroup(groupId, startUid)
+
+    fun switchScope(targetUid: String, accountId: Long, groupId: Long?) {
+        container.taskScheduler.switchScope(targetUid, accountId, groupId)
     }
 
     fun pause() = container.taskScheduler.pause()
@@ -106,6 +118,7 @@ data class HomeDashboard(
     val account: Account? = null,
     val target: Target? = null,
     val task: TaskUiState = TaskUiState(),
+    val today: TodayStats = TodayStats(),
     val needLogin: Boolean = true,
     val needTarget: Boolean = true,
 ) {

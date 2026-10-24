@@ -15,6 +15,19 @@ class TaskViewModel(
         container.taskScheduler.start(targetUid, accountId)
     }
 
+    fun start(targetUid: String, accountId: Long, groupId: Long?) {
+        container.taskScheduler.start(targetUid, accountId, groupId)
+    }
+
+    fun selectTarget(uid: String) = container.taskScheduler.selectTarget(uid)
+
+    fun selectGroup(groupId: Long, startUid: String? = null) =
+        container.taskScheduler.selectGroup(groupId, startUid)
+
+    fun switchScope(targetUid: String, accountId: Long, groupId: Long?) {
+        container.taskScheduler.switchScope(targetUid, accountId, groupId)
+    }
+
     fun pause() = container.taskScheduler.pause()
 
     fun resume(taskId: Long) = container.taskScheduler.resume(taskId)

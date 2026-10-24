@@ -42,6 +42,8 @@ import androidx.compose.ui.unit.dp
 import com.example.bilibiliautomation.ui.compose.components.Avatar
 import com.example.bilibiliautomation.ui.compose.components.BottomNav
 import com.example.bilibiliautomation.ui.compose.components.BiliTab
+import com.example.bilibiliautomation.ui.compose.components.EmptyArt
+import com.example.bilibiliautomation.ui.compose.components.EmptyHint
 import com.example.bilibiliautomation.ui.compose.components.PrimaryButton
 import com.example.bilibiliautomation.ui.compose.components.StatusBar
 import com.example.bilibiliautomation.ui.compose.components.TopHeader
@@ -116,6 +118,8 @@ fun AddTargetScreen(
             SearchResultList(
                 results = state.results,
                 selectedUid = state.selectedUid,
+                keyword = state.keyword,
+                loading = state.confirmMessage == "正在查询…",
                 onTargetSelect = onTargetSelect,
                 modifier = Modifier
                     .weight(1f)
@@ -217,6 +221,8 @@ private fun SearchSection(
 private fun SearchResultList(
     results: List<AddTargetResult>,
     selectedUid: String,
+    keyword: String,
+    loading: Boolean,
     onTargetSelect: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -224,12 +230,31 @@ private fun SearchResultList(
         modifier = modifier,
         verticalArrangement = Arrangement.spacedBy(BiliDimens.cardGap),
     ) {
-        items(results, key = { it.uid }) { item ->
-            TargetResultCard(
-                item = item,
-                selected = item.uid == selectedUid,
-                onClick = { onTargetSelect(item.uid) },
-            )
+        if (results.isEmpty()) {
+            item {
+                EmptyHint(
+                    art = EmptyArt.SEARCH,
+                    title = when {
+                        loading -> "正在查找这位 UP"
+                        keyword.isBlank() -> "先找一位你想支持的 UP"
+                        else -> "没有搜到这位 UP"
+                    },
+                    subtitle = when {
+                        loading -> "稍等一下，正在向哔哩哔哩查询资料。"
+                        keyword.isBlank() -> "在上面输入目标 UP 的 UID，点搜索就能看到主页信息。"
+                        else -> "请确认 UID 是否正确，或换一个再试试。"
+                    },
+                    modifier = Modifier.fillParentMaxSize(),
+                )
+            }
+        } else {
+            items(results, key = { it.uid }) { item ->
+                TargetResultCard(
+                    item = item,
+                    selected = item.uid == selectedUid,
+                    onClick = { onTargetSelect(item.uid) },
+                )
+            }
         }
     }
 }

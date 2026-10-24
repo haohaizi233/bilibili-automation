@@ -48,7 +48,7 @@ data class TaskSettingsUiState(
     val retries: String = "3",
     val cooldown: String = "30",
     val dailyLimit: String = "200",
-    val parallelTasks: Boolean = true,
+    val parallelTasks: Boolean = false,
     val smartStatus: Boolean = true,
     val autoSwitchAccount: Boolean = true,
     val autoRetry: Boolean = true,
