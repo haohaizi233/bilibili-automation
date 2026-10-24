@@ -31,4 +31,8 @@ class ProcessedUserRepository(
             relationshipState = relationshipState,
         )
     }
+
+    fun clear() {
+        seen.clear()
+    }
 }

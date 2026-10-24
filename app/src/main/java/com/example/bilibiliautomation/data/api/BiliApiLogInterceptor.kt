@@ -28,7 +28,7 @@ class BiliApiLogInterceptor(
             throw error
         }
         val elapsedMs = (System.nanoTime() - started) / 1_000_000L
-        logger.i(
+        logger.d(
             "api method=${sanitized.method} endpoint=$logicalName accountId=$accountId " +
                 "httpStatus=${response.code} elapsedMs=$elapsedMs wbiSigned=$wbiSigned",
         )

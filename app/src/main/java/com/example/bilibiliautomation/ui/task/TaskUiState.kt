@@ -26,4 +26,8 @@ data class TaskUiState(
     val currentVideoTitle: String = "",
     val currentBvid: String = "",
     val currentVideoCover: String = "",
+    val groupId: Long? = null,
+    val groupName: String? = null,
+    val groupIndex: Int = 0,
+    val groupSize: Int = 0,
 )

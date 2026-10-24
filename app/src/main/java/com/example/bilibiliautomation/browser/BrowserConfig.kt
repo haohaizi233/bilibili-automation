@@ -3,7 +3,7 @@ package com.example.bilibiliautomation.browser
 data class BrowserConfig(
     val javaScriptEnabled: Boolean = true,
     val domStorageEnabled: Boolean = true,
-    val debugEnabled: Boolean = true,
+    val debugEnabled: Boolean = false,
     val userAgent: String? = null,
     val timeoutMs: Long = DEFAULT_TIMEOUT_MS,
     val pollIntervalMs: Long = DEFAULT_POLL_INTERVAL_MS,

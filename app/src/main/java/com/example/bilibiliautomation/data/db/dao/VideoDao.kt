@@ -29,4 +29,7 @@ interface VideoDao {
         cursor: String?,
         updatedAt: Long,
     )
+
+    @Query("DELETE FROM videos")
+    suspend fun deleteAll()
 }

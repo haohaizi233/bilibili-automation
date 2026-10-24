@@ -16,7 +16,9 @@ import com.example.bilibiliautomation.data.repository.ActionRepository
 import com.example.bilibiliautomation.data.repository.CommentRepository
 import com.example.bilibiliautomation.data.repository.ProcessedUserRepository
 import com.example.bilibiliautomation.data.repository.QrLoginRepository
+import com.example.bilibiliautomation.data.repository.SmsLoginRepository
 import com.example.bilibiliautomation.data.repository.TargetRepository
+import com.example.bilibiliautomation.data.repository.TaskGroupRepository
 import com.example.bilibiliautomation.data.repository.TaskRepository
 import com.example.bilibiliautomation.data.repository.UserRepository
 import com.example.bilibiliautomation.data.repository.VideoRepository
@@ -36,6 +38,7 @@ import com.example.bilibiliautomation.domain.workflow.WebViewAutomationBackend
 import com.example.bilibiliautomation.domain.workflow.WorkflowEngine
 import com.example.bilibiliautomation.event.AutomationEventBus
 import com.example.bilibiliautomation.logging.AutomationLogger
+import com.example.bilibiliautomation.service.TaskStatusNotifier
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -51,13 +54,14 @@ class AppContainer(
     val logger = AutomationLogger
 
     val accountRepository = AccountRepository(database.accountDao())
-    val targetRepository = TargetRepository(database.targetDao())
+    val targetRepository = TargetRepository(database.targetDao(), database.taskGroupDao())
     val videoRepository = VideoRepository(database.videoDao())
     val commentRepository = CommentRepository(database.commentDao())
     val userRepository = UserRepository(database.userDao())
     val processedUserRepository = ProcessedUserRepository(userRepository)
     val actionRepository = ActionRepository(database.actionHistoryDao())
     val taskRepository = TaskRepository(database.taskDao())
+    val taskGroupRepository = TaskGroupRepository(database.taskGroupDao(), database.targetDao())
     val settingsRepository = SettingsRepository(appContext)
 
     val sessionStore = SecureSessionStore(EncryptedPrefsSessionBlobStore(appContext), logger)
@@ -78,6 +82,7 @@ class AppContainer(
     val biliApiProvider = DirectBiliApiProvider(biliApiClient, apiSessionManager, logger)
     val userProfileSync = UserProfileSync(biliApiProvider, accountRepository, targetRepository, apiSessionManager, logger)
     val qrLoginRepository = QrLoginRepository(biliApiProvider, apiSessionManager, logger)
+    val smsLoginRepository = SmsLoginRepository(biliApiProvider, apiSessionManager, logger)
     val relationActionClient = RelationActionClient(biliApiProvider, logger)
     val webViewFallbackBackend = WebViewAutomationBackend()
     val apiBackend = ApiAutomationBackend(biliApiProvider)
@@ -91,21 +96,29 @@ class AppContainer(
     val crashRecovery = CrashRecovery(taskRepository, logger)
 
     private val latestSettings = MutableStateFlow(AppSettings())
+    private val taskNotifier = TaskStatusNotifier(appContext) { latestSettings.value }
 
     val taskScheduler: TaskScheduler = TaskScheduler(
         taskRepository = taskRepository,
         accountRepository = accountRepository,
         targetRepository = targetRepository,
+        taskGroupRepository = taskGroupRepository,
         accountPool = accountPool,
         eventBus = eventBus,
-        engineFactory = { createApiWorkflowEngine(latestSettings.value) },
+        engineFactory = { createApiWorkflowEngine() },
         adapterFactory = { createAdapter() },
         logger = logger,
     )
 
     init {
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-            settingsRepository.settings.collect { latestSettings.value = it }
+            settingsRepository.settings.collect { cfg ->
+                latestSettings.value = cfg
+                logger.verbose = cfg.debugEnabled
+            }
+        }
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            eventBus.events.collect { taskNotifier.onEvent(it) }
         }
         // Warm up the session jar: activate the most recent ACTIVE account so
         // every ViewModel that reads activeAccountId / calls jar(accountId) gets
@@ -118,9 +131,6 @@ class AppContainer(
             // if they back out or the scan fails, it was never cleaned up).
             runCatching { accountRepository.deletePendingPlaceholders() }
             apiSessionManager.ensureActiveAccountId()
-            // Populate the active account's following count (nav) so the
-            // account panel can show "关注：N" as a task-progress indicator
-            // without requiring a login or task run first.
             runCatching {
                 apiSessionManager.activeAccountId?.let { userProfileSync.refreshStats(it) }
             }
@@ -147,7 +157,7 @@ class AppContainer(
         )
     }
 
-    fun createApiWorkflowEngine(settings: AppSettings = AppSettings()): ApiWorkflowEngine {
+    fun createApiWorkflowEngine(): ApiWorkflowEngine {
         return ApiWorkflowEngine(
             backend = apiBackend,
             taskRepository = taskRepository,
@@ -158,11 +168,11 @@ class AppContainer(
             actionRepository = actionRepository,
             accountManager = accountManager,
             accountPool = accountPool,
-            rateLimiter = RateLimiter(settings),
+            rateLimiter = RateLimiter { latestSettings.value },
+            settings = { latestSettings.value },
             eventBus = eventBus,
             logger = logger,
             dryRun = false,
-            maxRetries = settings.retryCount,
         )
     }
 

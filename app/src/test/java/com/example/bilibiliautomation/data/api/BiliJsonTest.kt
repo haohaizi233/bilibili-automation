@@ -89,4 +89,27 @@ class BiliJsonTest {
             BiliJson.parseQrPoll(JSONObject("""{"code":0,"url":"https://www.bilibili.com"}""")).mapped,
         )
     }
+
+    @Test
+    fun parseLoginCaptchaAndSmsSend() {
+        val captcha = BiliJson.parseLoginCaptcha(
+            JSONObject(
+                """{"type":"geetest","token":"tok","geetest":{"gt":"gt-1","challenge":"ch-1"},"tencent":{"appid":""}}""",
+            ),
+        )!!
+        assertEquals("tok", captcha.token)
+        assertEquals("gt-1", captcha.gt)
+        assertEquals("ch-1", captcha.challenge)
+        val sent = BiliJson.parseSmsSend(JSONObject("""{"captcha_key":"ck-9"}"""))!!
+        assertEquals("ck-9", sent.captchaKey)
+        val countries = BiliJson.parseSmsCountries(
+            JSONObject("""{"common":[{"id":1,"cname":"中国","country_id":"86"}],"others":[{"id":5,"cname":"美国","country_id":"1"}]}"""),
+        )
+        assertEquals(1, countries.first().cid)
+        assertEquals("86", countries.first().countryId)
+        assertEquals(2, countries.size)
+        org.junit.Assert.assertNull(
+            BiliJson.parseLoginCaptcha(JSONObject("""{"type":"geetest","token":"tok","geetest":{"gt":"gt-1"}}""")),
+        )
+    }
 }

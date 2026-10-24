@@ -1,11 +1,14 @@
 package com.example.bilibiliautomation.data.api
 
 import com.example.bilibiliautomation.data.api.dto.CommentPage
+import com.example.bilibiliautomation.data.api.dto.LoginCaptcha
 import com.example.bilibiliautomation.data.api.dto.NavUser
 import com.example.bilibiliautomation.data.api.dto.QrGenerateData
 import com.example.bilibiliautomation.data.api.dto.QrPollData
 import com.example.bilibiliautomation.data.api.dto.RelationSnapshot
 import com.example.bilibiliautomation.data.api.dto.RelationStat
+import com.example.bilibiliautomation.data.api.dto.SmsCountry
+import com.example.bilibiliautomation.data.api.dto.SmsSendResult
 import com.example.bilibiliautomation.data.api.dto.VideoItem
 import com.example.bilibiliautomation.data.api.dto.SpaceUser
 import com.example.bilibiliautomation.data.api.dto.VideoPage
@@ -30,6 +33,24 @@ class ThirdPartyBiliApiProvider(
 
     override suspend fun getLoginQr(accountId: Long) = err<QrGenerateData>()
     override suspend fun pollLogin(accountId: Long, qrcodeKey: String) = err<QrPollData>()
+    override suspend fun getLoginCaptcha(accountId: Long) = err<LoginCaptcha>()
+    override suspend fun sendSmsCode(
+        accountId: Long,
+        cid: Int,
+        tel: String,
+        token: String,
+        challenge: String,
+        validate: String,
+        seccode: String,
+    ) = err<SmsSendResult>()
+    override suspend fun loginWithSms(
+        accountId: Long,
+        cid: Int,
+        tel: String,
+        code: String,
+        captchaKey: String,
+    ) = err<Unit>()
+    override suspend fun listSmsCountries(accountId: Long) = err<List<SmsCountry>>()
     override suspend fun checkSession(accountId: Long) = err<SessionState>()
     override suspend fun getUserVideos(accountId: Long, uid: Long, page: Int, pageSize: Int) = err<VideoPage>()
     override fun getAllUserVideos(accountId: Long, uid: Long, pageSize: Int, maxPages: Int): Flow<VideoItem> = flow {

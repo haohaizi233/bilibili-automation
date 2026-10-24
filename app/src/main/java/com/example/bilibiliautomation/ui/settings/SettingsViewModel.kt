@@ -4,6 +4,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.bilibiliautomation.app.AppContainer
 import com.example.bilibiliautomation.domain.model.AppSettings
+import com.example.bilibiliautomation.ui.UiFormat
+import com.example.bilibiliautomation.ui.compose.screens.TaskSettingsUiState
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
@@ -21,26 +23,41 @@ class SettingsViewModel(
 
     fun setNotifications(enabled: Boolean) = update { it.copy(notificationEnabled = enabled) }
 
-    fun applyTaskSettings(
-        intervalMs: Long,
-        retryCount: Int,
-        cooldownMinutes: Int,
-        dailyLimit: Int,
-        notify: Boolean,
-        debug: Boolean,
-    ) = update {
+    fun setUnattended(enabled: Boolean) = update { it.copy(unattendedMode = enabled) }
+
+    fun applyTaskSettings(state: TaskSettingsUiState) = update {
         it.copy(
-            operationIntervalMs = intervalMs.coerceAtLeast(200L),
-            retryCount = retryCount.coerceIn(0, 10),
-            cooldownMinutes = cooldownMinutes.coerceAtLeast(1),
-            dailyLimit = dailyLimit.coerceAtLeast(1),
-            notificationEnabled = notify,
-            debugEnabled = debug,
+            operationIntervalMs = UiFormat.parseIntervalMs(state.interval),
+            retryCount = state.retries.toIntOrNull()?.coerceIn(0, 10) ?: 3,
+            cooldownMinutes = state.cooldown.toIntOrNull()?.coerceAtLeast(1) ?: 30,
+            dailyLimit = state.dailyLimit.toIntOrNull()?.coerceAtLeast(1) ?: 200,
+            parallelTasks = state.parallelTasks,
+            smartStatus = state.smartStatus,
+            autoSwitchAccount = state.autoSwitchAccount,
+            autoRetry = state.autoRetry,
+            notificationEnabled = state.notifyOnComplete,
+            debugEnabled = state.verboseLog,
         )
     }
 
     fun clearLogs() {
         com.example.bilibiliautomation.logging.AutomationLogger.clear()
+    }
+
+    fun clearHistory() {
+        viewModelScope.launch {
+            container.taskScheduler.cancel()
+            container.taskRepository.deleteAll()
+            container.videoRepository.deleteAll()
+            container.commentRepository.deleteAll()
+            container.userRepository.deleteAll()
+            container.actionRepository.deleteAll()
+            container.processedUserRepository.clear()
+            com.example.bilibiliautomation.ui.FaceBitmapCache.clear()
+            com.example.bilibiliautomation.logging.AutomationLogger.clear()
+            container.taskScheduler.resetUi()
+            com.example.bilibiliautomation.logging.AutomationLogger.i("history cache cleared")
+        }
     }
 
     private fun update(transform: (AppSettings) -> AppSettings) {

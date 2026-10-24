@@ -1,6 +1,7 @@
 package com.example.bilibiliautomation.data.repository
 
 import com.example.bilibiliautomation.data.db.dao.TargetDao
+import com.example.bilibiliautomation.data.db.dao.TaskGroupDao
 import com.example.bilibiliautomation.data.db.entity.TargetEntity
 import com.example.bilibiliautomation.domain.model.Target
 import com.example.bilibiliautomation.util.TimeMs
@@ -11,6 +12,7 @@ import kotlinx.coroutines.withContext
 
 class TargetRepository(
     private val dao: TargetDao,
+    private val groupDao: TaskGroupDao? = null,
 ) {
     fun observeAll(): Flow<List<Target>> = dao.observeAll().map { list -> list.map { it.toModel() } }
 
@@ -69,10 +71,12 @@ class TargetRepository(
     }
 
     suspend fun delete(id: Long) = withContext(Dispatchers.IO) {
+        dao.getById(id)?.let { groupDao?.deleteMembersByTarget(it.uid) }
         dao.deleteById(id)
     }
 
     suspend fun deleteByUid(uid: String) = withContext(Dispatchers.IO) {
+        groupDao?.deleteMembersByTarget(uid)
         dao.getByUid(uid)?.let { dao.deleteById(it.id) }
     }
 

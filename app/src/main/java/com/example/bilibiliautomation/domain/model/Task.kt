@@ -5,6 +5,8 @@ data class Task(
     val status: TaskStatus,
     val targetUid: String?,
     val accountId: Long?,
+    val groupId: Long? = null,
+    val groupIndex: Int = 0,
     val createdAt: Long,
     val startedAt: Long?,
     val pausedAt: Long?,

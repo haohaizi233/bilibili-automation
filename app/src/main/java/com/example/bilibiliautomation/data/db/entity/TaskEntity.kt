@@ -19,6 +19,8 @@ data class TaskEntity(
     val status: TaskStatus = TaskStatus.IDLE,
     val targetUid: String? = null,
     val accountId: Long? = null,
+    val groupId: Long? = null,
+    val groupIndex: Int = 0,
     val createdAt: Long,
     val startedAt: Long? = null,
     val pausedAt: Long? = null,

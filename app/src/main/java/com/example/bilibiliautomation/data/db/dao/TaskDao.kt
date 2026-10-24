@@ -51,4 +51,10 @@ interface TaskDao {
 
     @Query("SELECT * FROM task_checkpoints WHERE taskId = :taskId LIMIT 1")
     suspend fun getCheckpoint(taskId: Long): TaskCheckpointEntity?
+
+    @Query("DELETE FROM task_checkpoints")
+    suspend fun deleteAllCheckpoints()
+
+    @Query("DELETE FROM tasks")
+    suspend fun deleteAll()
 }

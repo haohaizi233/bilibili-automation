@@ -5,6 +5,7 @@ import com.example.bilibiliautomation.domain.model.Account
 import com.example.bilibiliautomation.domain.model.AccountStatus
 import com.example.bilibiliautomation.domain.model.AppSettings
 import com.example.bilibiliautomation.domain.model.Target
+import com.example.bilibiliautomation.domain.model.TaskGroupDetail
 import com.example.bilibiliautomation.domain.model.TaskStatus
 import com.example.bilibiliautomation.logging.LogRecord
 import com.example.bilibiliautomation.ui.compose.screens.AccountItem
@@ -14,15 +15,13 @@ import com.example.bilibiliautomation.ui.compose.screens.HomeTaskStatus
 import com.example.bilibiliautomation.ui.compose.screens.LogEntry
 import com.example.bilibiliautomation.ui.compose.screens.LogLevel
 import com.example.bilibiliautomation.ui.compose.screens.TargetItem
+import com.example.bilibiliautomation.ui.compose.screens.TaskGroupItem
 import com.example.bilibiliautomation.ui.compose.screens.TaskRunningUiState
 import com.example.bilibiliautomation.ui.compose.screens.TaskRunningPhase
 import com.example.bilibiliautomation.ui.compose.screens.TaskSettingsUiState
 import com.example.bilibiliautomation.ui.task.TaskUiState
 import com.example.bilibiliautomation.util.MediaUrls
 import com.example.bilibiliautomation.util.TimeMs
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 object UiFormat {
     fun fans(count: Long): String {
@@ -82,7 +81,7 @@ object UiFormat {
 
     fun lastUsed(epochMs: Long?): String? {
         if (epochMs == null || epochMs <= 0L) return null
-        return SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA).format(Date(epochMs))
+        return TimeMs.formatBeijing(epochMs, "yyyy-MM-dd HH:mm")
     }
 
     fun cooldown(until: Long?, now: Long = TimeMs.wallClock()): String? {
@@ -104,6 +103,10 @@ object UiFormat {
             retries = settings.retryCount.toString(),
             cooldown = settings.cooldownMinutes.toString(),
             dailyLimit = settings.dailyLimit.toString(),
+            parallelTasks = settings.parallelTasks,
+            smartStatus = settings.smartStatus,
+            autoSwitchAccount = settings.autoSwitchAccount,
+            autoRetry = settings.autoRetry,
             notifyOnComplete = settings.notificationEnabled,
             verboseLog = settings.debugEnabled,
         )
@@ -132,6 +135,12 @@ object UiFormat {
         fans = fansOrDash(target.fansCount),
         hot = target.enabled,
         avatarUrl = target.avatarUrl,
+    )
+
+    fun toTaskGroupItem(detail: TaskGroupDetail): TaskGroupItem = TaskGroupItem(
+        id = detail.group.id,
+        name = detail.group.name,
+        members = detail.members.map(::toTargetItem),
     )
 
     fun toAddTargetResult(user: SpaceUser): AddTargetResult = AddTargetResult(
@@ -182,13 +191,15 @@ object UiFormat {
             paused = state.status == TaskStatus.PAUSED ||
                 state.status == TaskStatus.INTERRUPTED ||
                 state.status == TaskStatus.COOLDOWN,
+            groupId = state.groupId,
+            groupName = state.groupName.orEmpty(),
+            groupIndex = state.groupIndex,
+            groupSize = state.groupSize,
         )
     }
 
     fun toLogEntry(record: LogRecord): LogEntry {
-        val time = record.timestampIso.substringAfter('T').take(8).ifBlank {
-            SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(record.timestamp))
-        }
+        val time = TimeMs.formatBeijing(record.timestamp, "HH:mm:ss")
         val level = when (record.level) {
             com.example.bilibiliautomation.logging.LogLevel.SUCCESS -> LogLevel.SUCCESS
             com.example.bilibiliautomation.logging.LogLevel.WARN -> LogLevel.WARN

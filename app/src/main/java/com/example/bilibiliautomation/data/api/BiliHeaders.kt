@@ -10,6 +10,11 @@ object BiliHeaders {
             "AppleWebKit/537.36 (KHTML, like Gecko) " +
             "Chrome/139.0.0.0 Safari/537.36"
 
+    /** Phone WebView UA so official GeeTest slider is a touch widget, not a clipped desktop popup. */
+    const val MOBILE_USER_AGENT: String =
+        "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"
+
     const val REFERER: String = "https://www.bilibili.com"
     const val ORIGIN: String = "https://www.bilibili.com"
     const val ACCEPT: String = "application/json, text/plain, */*"

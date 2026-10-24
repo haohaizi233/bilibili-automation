@@ -43,6 +43,8 @@ import com.example.bilibiliautomation.ui.compose.components.BiliCard
 import com.example.bilibiliautomation.ui.compose.components.BiliTab
 import com.example.bilibiliautomation.ui.compose.components.BottomNav
 import com.example.bilibiliautomation.ui.compose.components.DotsMenu
+import com.example.bilibiliautomation.ui.compose.components.EmptyArt
+import com.example.bilibiliautomation.ui.compose.components.EmptyHint
 import com.example.bilibiliautomation.ui.compose.components.MetricCell
 import com.example.bilibiliautomation.ui.compose.components.PrimaryButton
 import com.example.bilibiliautomation.ui.compose.components.ProgressTrack
@@ -67,6 +69,12 @@ fun HomeScreen(
     onStart: () -> Unit = {},
     onTaskSettings: () -> Unit = {},
     onAccountMore: () -> Unit = {},
+    switchableTargets: List<TargetItem> = emptyList(),
+    switchableGroups: List<TaskGroupItem> = emptyList(),
+    selectedGroupId: Long? = null,
+    selectedTargetUid: String? = null,
+    onSelectTarget: (String) -> Unit = {},
+    onSelectGroup: (Long) -> Unit = {},
     taskStatus: HomeTaskStatus = HomeTaskStatus.RUNNING,
     elapsed: String = PreviewMockData.HOME_ELAPSED,
     accountPainter: Painter? = null,
@@ -83,6 +91,10 @@ fun HomeScreen(
     upImageUrl: String? = null,
     accountStatus: AccountStatus = AccountStatus.OK,
     upStatus: AccountStatus = AccountStatus.OK,
+    hasAccount: Boolean = true,
+    hasTarget: Boolean = true,
+    onAddAccount: () -> Unit = {},
+    onAddTarget: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -99,6 +111,19 @@ fun HomeScreen(
         ) {
             BrandHeader(brandPainter)
             Spacer(Modifier.height(htmlDp(4)))
+            if (taskStatus == HomeTaskStatus.IDLE && (!hasAccount || !hasTarget)) {
+                EmptyHint(
+                    art = if (!hasAccount) EmptyArt.ACCOUNT else EmptyArt.TARGET,
+                    title = if (!hasAccount) "先添加一个账号吧" else "再选一位目标 UP",
+                    subtitle = if (!hasAccount) {
+                        "助手会用你自己的哔哩哔哩账号去支持喜欢的 UP。扫码登录后，信息只留在这台手机上。"
+                    } else {
+                        "账号已经准备好了。添加目标 UP 后，就可以从首页开始任务。"
+                    },
+                    actionLabel = if (!hasAccount) "去添加账号" else "去添加目标 UP",
+                    onAction = if (!hasAccount) onAddAccount else onAddTarget,
+                )
+            }
             StatusCard(
                 status = taskStatus,
                 elapsed = elapsed,
@@ -106,7 +131,19 @@ fun HomeScreen(
                 onStart = onStart,
             )
             CurrentAccountRow(painter = accountPainter, imageUrl = accountImageUrl, subtitle = accountSubtitle, status = accountStatus, onMore = onAccountMore)
-            CurrentUpRow(painter = upPainter, imageUrl = upImageUrl, subtitle = upSubtitle, status = upStatus, onMore = onTaskSettings)
+            CurrentUpRow(
+                painter = upPainter,
+                imageUrl = upImageUrl,
+                subtitle = upSubtitle,
+                status = upStatus,
+                switchableTargets = switchableTargets,
+                switchableGroups = switchableGroups,
+                selectedGroupId = selectedGroupId,
+                selectedTargetUid = selectedTargetUid,
+                onSelectTarget = onSelectTarget,
+                onSelectGroup = onSelectGroup,
+                onFallbackMore = onTaskSettings,
+            )
             ProgressCard(
                 done = progressDone,
                 total = progressTotal.coerceAtLeast(1),
@@ -194,7 +231,7 @@ private fun StatusCard(
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .height(htmlDp(172))
+            .heightIn(min = htmlDp(172))
             .background(
                 Brush.linearGradient(
                     listOf(Color(BiliColors.PINK), Color(BiliColors.PINK_2), Color(0xFFFF6A9A)),
@@ -212,12 +249,20 @@ private fun StatusCard(
             Column {
                 Text(title, color = Color.White, fontSize = htmlSp(29), fontWeight = FontWeight.Black)
                 Text(
-                    if (status == HomeTaskStatus.IDLE) "00:00:00" else elapsed,
+                    if (status == HomeTaskStatus.IDLE) "准备就绪" else elapsed,
                     color = Color.White,
-                    fontSize = htmlSp(52),
+                    fontSize = htmlSp(if (status == HomeTaskStatus.IDLE) 36 else 52),
                     fontWeight = FontWeight.Black,
                     modifier = Modifier.padding(top = htmlDp(12)),
                 )
+                if (status == HomeTaskStatus.IDLE) {
+                    Text(
+                        "添加账号和目标 UP 后就能开始",
+                        color = Color.White.copy(alpha = 0.86f),
+                        fontSize = htmlSp(18),
+                        modifier = Modifier.padding(top = htmlDp(8)),
+                    )
+                }
             }
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -273,7 +318,20 @@ private fun CurrentAccountRow(painter: Painter?, imageUrl: String?, subtitle: St
 }
 
 @Composable
-private fun CurrentUpRow(painter: Painter?, imageUrl: String?, subtitle: String, status: AccountStatus, onMore: () -> Unit) {
+private fun CurrentUpRow(
+    painter: Painter?,
+    imageUrl: String?,
+    subtitle: String,
+    status: AccountStatus,
+    switchableTargets: List<TargetItem>,
+    switchableGroups: List<TaskGroupItem>,
+    selectedGroupId: Long?,
+    selectedTargetUid: String?,
+    onSelectTarget: (String) -> Unit,
+    onSelectGroup: (Long) -> Unit,
+    onFallbackMore: () -> Unit,
+) {
+    var menuExpanded by remember { mutableStateOf(false) }
     BiliCard(modifier = Modifier.fillMaxWidth().padding(top = htmlDp(18))) {
         Row(
             modifier = Modifier
@@ -295,7 +353,22 @@ private fun CurrentUpRow(painter: Painter?, imageUrl: String?, subtitle: String,
                 )
             }
             Tag(status.label, status.style)
-            DotsMenu(Modifier.padding(start = htmlDp(11)), onClick = onMore)
+            Box {
+                DotsMenu(Modifier.padding(start = htmlDp(11)), onClick = {
+                    if (switchableTargets.isEmpty() && switchableGroups.isEmpty()) onFallbackMore()
+                    else menuExpanded = true
+                })
+                ScopeSwitchMenu(
+                    expanded = menuExpanded,
+                    onDismiss = { menuExpanded = false },
+                    groups = switchableGroups,
+                    targets = switchableTargets,
+                    selectedGroupId = selectedGroupId,
+                    selectedTargetUid = selectedTargetUid,
+                    onSelectGroup = onSelectGroup,
+                    onSelectTarget = onSelectTarget,
+                )
+            }
         }
     }
 }
@@ -355,6 +428,26 @@ private fun HomeScreenPreview() {
             onTabSelect = { selectedTab = it },
             onPause = {},
             onStop = {},
+        )
+    }
+}
+
+@Preview(name = "01 首页 · 空", showBackground = true, device = Devices.PIXEL_7)
+@Composable
+private fun HomeScreenEmptyPreview() {
+    BiliTheme {
+        HomeScreen(
+            onTabSelect = {},
+            taskStatus = HomeTaskStatus.IDLE,
+            hasAccount = false,
+            hasTarget = false,
+            accountSubtitle = "未登录，请先添加账号",
+            upSubtitle = "未选择目标 UP",
+            progressDone = 0,
+            progressTotal = 0,
+            followed = 0,
+            skipped = 0,
+            failed = 0,
         )
     }
 }

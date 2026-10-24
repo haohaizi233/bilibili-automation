@@ -2,6 +2,7 @@ package com.example.bilibiliautomation.domain.task
 
 import com.example.bilibiliautomation.data.repository.AccountRepository
 import com.example.bilibiliautomation.data.repository.TargetRepository
+import com.example.bilibiliautomation.data.repository.TaskGroupRepository
 import com.example.bilibiliautomation.data.repository.TaskRepository
 import com.example.bilibiliautomation.domain.model.Account
 import com.example.bilibiliautomation.domain.model.AutomationResult
@@ -31,6 +32,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.isActive
 
 /**
  * First version allows one active workflow. A second start while RUNNING is queued
@@ -40,6 +43,7 @@ class TaskScheduler(
     private val taskRepository: TaskRepository,
     private val accountRepository: AccountRepository,
     private val targetRepository: TargetRepository,
+    private val taskGroupRepository: TaskGroupRepository,
     private val accountPool: AccountPool,
     private val eventBus: AutomationEventBus,
     private val engineFactory: () -> RunnableWorkflow,
@@ -77,6 +81,9 @@ class TaskScheduler(
 
     @Volatile
     private var startedAt: Long = 0L
+
+    @Volatile
+    private var stopGroup: Boolean = false
 
     val hasActiveTask: Boolean get() = activeJob?.isActive == true
 
@@ -198,62 +205,157 @@ class TaskScheduler(
         }
     }
 
-    fun start(targetUid: String, accountId: Long): AutomationResult<Long> {
+    fun start(targetUid: String, accountId: Long, groupId: Long? = null): AutomationResult<Long> {
         if (hasActiveTask) {
             logger.w("TaskScheduler busy — refusing second concurrent WebView task")
             return AutomationResult.fail(ResultCode.BUSY, "already running")
         }
         val launch = scope.launch {
             mutex.withLock {
-                val resolved = resolveIdleAccount(accountId)
-                val boundId = resolved?.id ?: accountId
-                val task = taskRepository.create(targetUid, boundId)
-                val now = TimeMs.wallClock()
-                taskRepository.updateStatus(task.id, TaskStatus.RUNNING, startedAt = now)
-                startedAt = TimeMs.now()
-                val account = resolved ?: accountRepository.getById(boundId)
-                val target = targetRepository.getByUid(targetUid)
-                publish(
-                    _ui.value.copy(
-                        status = TaskStatus.RUNNING,
-                        workflowState = WorkflowState.VALIDATE_ACCOUNT,
-                        taskId = task.id,
-                        account = account,
-                        target = target,
-                        currentAction = "start",
-                        message = "running",
-                        startedAt = now,
-                        pausedAt = null,
-                        followed = 0,
-                        skipped = 0,
-                        failed = 0,
-                        interruptedTaskId = null,
-                    ),
-                )
-                eventBus.emit(AutomationEvent.TaskStarted(task.id))
-                val wf = engineFactory()
-                engine = wf
-                try {
-                    wf.run(task.copy(status = TaskStatus.RUNNING, startedAt = now))
-                } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                    throw cancelled
-                } catch (error: Throwable) {
-                    logger.e("TaskScheduler start workflow crashed", error)
-                    publish(
-                        _ui.value.copy(
-                            status = TaskStatus.FAILED,
-                            workflowState = WorkflowState.FAILED,
-                            currentAction = "crash",
-                            message = error.message ?: error.javaClass.simpleName,
-                        ),
+                stopGroup = false
+                val group = groupId?.let { taskGroupRepository.getDetail(it) }
+                val members = group?.members?.map { it.uid }.orEmpty()
+                    .ifEmpty { listOf(targetUid) }
+                var index = members.indexOf(targetUid).let { if (it < 0) 0 else it }
+                while (index < members.size && coroutineContext.isActive && !stopGroup) {
+                    runOneLocked(
+                        targetUid = members[index],
+                        accountId = accountId,
+                        groupId = group?.group?.id,
+                        groupName = group?.group?.name,
+                        groupIndex = index,
+                        groupSize = members.size,
                     )
+                    val status = _ui.value.status
+                    if (status != TaskStatus.FINISHED) break
+                    index += 1
                 }
-                engine = null
-                refreshFromDb(task.id)
             }
         }
         activeJob = launch
         return AutomationResult.ok(0L, "started")
+    }
+
+    fun selectTarget(uid: String) {
+        scope.launch {
+            val target = targetRepository.getByUid(uid) ?: return@launch
+            publish(
+                _ui.value.copy(
+                    target = target,
+                    groupId = null,
+                    groupName = null,
+                    groupIndex = 0,
+                    groupSize = 0,
+                    message = "selected up ${target.uid}",
+                ),
+            )
+        }
+    }
+
+    fun selectGroup(groupId: Long, startUid: String? = null) {
+        scope.launch {
+            val detail = taskGroupRepository.getDetail(groupId) ?: return@launch
+            if (detail.members.isEmpty()) {
+                logger.w("task group empty id=$groupId")
+                return@launch
+            }
+            val index = startUid?.let { uid -> detail.members.indexOfFirst { it.uid == uid } }
+                ?.takeIf { it >= 0 } ?: 0
+            publish(
+                _ui.value.copy(
+                    target = detail.members[index],
+                    groupId = detail.group.id,
+                    groupName = detail.group.name,
+                    groupIndex = index,
+                    groupSize = detail.members.size,
+                    message = "selected group ${detail.group.name}",
+                ),
+            )
+        }
+    }
+
+    fun switchScope(targetUid: String, accountId: Long, groupId: Long?) {
+        scope.launch {
+            stopGroup = true
+            engine?.cancelRequested = true
+            val previousId = _ui.value.taskId
+            activeJob?.cancel()
+            activeJob?.join()
+            if (previousId != null) {
+                taskRepository.updateStatus(
+                    previousId,
+                    TaskStatus.CANCELLED,
+                    lastError = "switched",
+                    finishedAt = TimeMs.wallClock(),
+                )
+            }
+            start(targetUid, accountId, groupId)
+        }
+    }
+
+    private suspend fun runOneLocked(
+        targetUid: String,
+        accountId: Long,
+        groupId: Long?,
+        groupName: String?,
+        groupIndex: Int,
+        groupSize: Int,
+    ) {
+        val resolved = resolveIdleAccount(accountId)
+        val boundId = resolved?.id ?: accountId
+        val task = taskRepository.create(targetUid, boundId, groupId, groupIndex)
+        val now = TimeMs.wallClock()
+        taskRepository.updateStatus(task.id, TaskStatus.RUNNING, startedAt = now)
+        startedAt = TimeMs.now()
+        val account = resolved ?: accountRepository.getById(boundId)
+        val target = targetRepository.getByUid(targetUid)
+        publish(
+            _ui.value.copy(
+                status = TaskStatus.RUNNING,
+                workflowState = WorkflowState.VALIDATE_ACCOUNT,
+                taskId = task.id,
+                account = account,
+                target = target,
+                currentAction = "start",
+                message = if (groupName.isNullOrBlank()) "running" else "running group $groupName ${groupIndex + 1}/$groupSize",
+                startedAt = now,
+                pausedAt = null,
+                followed = 0,
+                skipped = 0,
+                failed = 0,
+                interruptedTaskId = null,
+                groupId = groupId,
+                groupName = groupName,
+                groupIndex = groupIndex,
+                groupSize = groupSize,
+                videoProgress = Progress(),
+                commentProgress = Progress(),
+                currentVideoTitle = "",
+                currentBvid = "",
+                currentVideoCover = "",
+            ),
+        )
+        eventBus.emit(AutomationEvent.TaskStarted(task.id))
+        val wf = engineFactory()
+        engine = wf
+        try {
+            wf.run(task.copy(status = TaskStatus.RUNNING, startedAt = now, groupId = groupId, groupIndex = groupIndex))
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            engine = null
+            throw cancelled
+        } catch (error: Throwable) {
+            logger.e("TaskScheduler start workflow crashed", error)
+            publish(
+                _ui.value.copy(
+                    status = TaskStatus.FAILED,
+                    workflowState = WorkflowState.FAILED,
+                    currentAction = "crash",
+                    message = error.message ?: error.javaClass.simpleName,
+                ),
+            )
+        }
+        engine = null
+        refreshFromDb(task.id)
     }
 
     fun pause() {
@@ -314,14 +416,20 @@ class TaskScheduler(
     }
 
     fun cancel() {
+        stopGroup = true
         engine?.cancelRequested = true
+        val id = _ui.value.taskId
         activeJob?.cancel()
-        _ui.value.taskId?.let { id ->
+        if (id != null) {
             scope.launch {
                 taskRepository.updateStatus(id, TaskStatus.CANCELLED, lastError = "cancelled", finishedAt = TimeMs.wallClock())
             }
         }
         publish(_ui.value.copy(status = TaskStatus.CANCELLED, currentAction = "cancelled"))
+    }
+
+    fun resetUi() {
+        publish(TaskUiState())
     }
 
     /**
@@ -380,6 +488,7 @@ class TaskScheduler(
             taskRepository.updateAccount(task.id, account.id)
         }
         val target = task.targetUid?.let { targetRepository.getByUid(it) }
+        val group = task.groupId?.let { taskGroupRepository.getDetail(it) }
         val videoTotal = checkpoint?.videoTotal ?: 0
         val commentTotal = checkpoint?.commentTotal ?: 0
         val videoCurrent = if (videoTotal > 0) (checkpoint?.videoIndex ?: 0).coerceIn(0, videoTotal - 1) + 1 else 0
@@ -404,6 +513,10 @@ class TaskScheduler(
                 currentVideoTitle = checkpoint?.currentVideoTitle.orEmpty(),
                 currentBvid = checkpoint?.videoId.orEmpty(),
                 currentVideoCover = checkpoint?.currentVideoCover.orEmpty(),
+                groupId = group?.group?.id,
+                groupName = group?.group?.name,
+                groupIndex = task.groupIndex,
+                groupSize = group?.members?.size ?: 0,
             ),
         )
         logger.i("restored task ui state task=${task.id} status=${task.status} videos=$videoCurrent/$videoTotal followed=${checkpoint?.followed ?: 0}")

@@ -5,6 +5,9 @@ import com.example.bilibiliautomation.data.api.dto.NavUser
 import com.example.bilibiliautomation.data.api.dto.QrGenerateData
 import com.example.bilibiliautomation.data.api.dto.QrPollCode
 import com.example.bilibiliautomation.data.api.dto.QrPollData
+import com.example.bilibiliautomation.data.api.dto.LoginCaptcha
+import com.example.bilibiliautomation.data.api.dto.SmsCountry
+import com.example.bilibiliautomation.data.api.dto.SmsSendResult
 import com.example.bilibiliautomation.data.api.dto.RelationSnapshot
 import com.example.bilibiliautomation.data.api.dto.RelationStat
 import com.example.bilibiliautomation.data.api.dto.RootComment
@@ -70,6 +73,48 @@ object BiliJson {
             message = obj.optString("message"),
             redirectUrl = obj.optString("url").takeIf { it.isNotBlank() },
         )
+    }
+
+    fun parseLoginCaptcha(data: JSONObject?): LoginCaptcha? {
+        val obj = data ?: return null
+        val token = obj.optString("token")
+        val gee = obj.optJSONObject("geetest") ?: obj
+        val gt = gee.optString("gt")
+        val challenge = gee.optString("challenge")
+        if (token.isBlank() || gt.isBlank() || challenge.isBlank()) return null
+        return LoginCaptcha(
+            type = obj.optString("type").ifBlank { "geetest" },
+            token = token,
+            gt = gt,
+            challenge = challenge,
+        )
+    }
+
+    fun parseSmsSend(data: JSONObject?): SmsSendResult? {
+        val obj = data ?: return null
+        val key = obj.optString("captcha_key")
+        if (key.isBlank()) return null
+        return SmsSendResult(captchaKey = key)
+    }
+
+    fun parseSmsCountries(data: JSONObject?): List<SmsCountry> {
+        val obj = data ?: return emptyList()
+        val out = mutableListOf<SmsCountry>()
+        fun addAll(array: org.json.JSONArray?) {
+            if (array == null) return
+            for (i in 0 until array.length()) {
+                val item = array.optJSONObject(i) ?: continue
+                val cid = item.optInt("id")
+                val name = item.optString("cname")
+                val countryId = item.optString("country_id")
+                if (cid > 0 && countryId.isNotBlank()) {
+                    out += SmsCountry(cid = cid, name = name.ifBlank { countryId }, countryId = countryId)
+                }
+            }
+        }
+        addAll(obj.optJSONArray("common"))
+        addAll(obj.optJSONArray("others"))
+        return out.distinctBy { it.cid }
     }
 
     fun parseVideoPage(data: JSONObject?, page: Int, pageSize: Int): VideoPage {

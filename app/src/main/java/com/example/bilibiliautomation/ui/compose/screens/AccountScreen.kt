@@ -44,6 +44,8 @@ import com.example.bilibiliautomation.ui.compose.components.BiliCard
 import com.example.bilibiliautomation.ui.compose.components.BiliTab
 import com.example.bilibiliautomation.ui.compose.components.BottomNav
 import com.example.bilibiliautomation.ui.compose.components.DotsMenu
+import com.example.bilibiliautomation.ui.compose.components.EmptyArt
+import com.example.bilibiliautomation.ui.compose.components.EmptyHint
 import com.example.bilibiliautomation.ui.compose.components.StatusBar
 import com.example.bilibiliautomation.ui.compose.components.Tag
 import com.example.bilibiliautomation.ui.compose.components.TagStyle
@@ -145,8 +147,21 @@ fun AccountScreen(
             verticalArrangement = Arrangement.spacedBy(htmlDp(17)),
             contentPadding = PaddingValues(vertical = htmlDp(8)),
         ) {
-            items(accounts, key = { if (it.id != 0L) it.id else it.name.hashCode().toLong() }) { item ->
-                AccountCard(item, isCurrent = item.id == currentAccountId, onSetCurrent = onSetCurrent, onDelete = onDelete)
+            if (accounts.isEmpty()) {
+                item {
+                    EmptyHint(
+                        art = EmptyArt.ACCOUNT,
+                        title = "还没有可用账号",
+                        subtitle = "扫码登录哔哩哔哩后，助手才能替你浏览视频、走过评论区。账号信息只保存在这台手机上。",
+                        actionLabel = "添加第一个账号",
+                        onAction = onAdd,
+                        modifier = Modifier.fillParentMaxSize(),
+                    )
+                }
+            } else {
+                items(accounts, key = { if (it.id != 0L) it.id else it.name.hashCode().toLong() }) { item ->
+                    AccountCard(item, isCurrent = item.id == currentAccountId, onSetCurrent = onSetCurrent, onDelete = onDelete)
+                }
             }
         }
         BottomNav(selected = selectedTab, onSelect = onTabSelect)
@@ -282,5 +297,13 @@ private fun AccountScreenPreview() {
     var selectedTab by remember { mutableStateOf(BiliTab.ACCOUNT) }
     BiliTheme {
         AccountScreen(selectedTab = selectedTab, onTabSelect = { selectedTab = it }, onAdd = {}, onBack = {})
+    }
+}
+
+@Preview(name = "02 账号管理 · 空", showBackground = true, device = Devices.PIXEL_7)
+@Composable
+private fun AccountScreenEmptyPreview() {
+    BiliTheme {
+        AccountScreen(onTabSelect = {}, accounts = emptyList())
     }
 }

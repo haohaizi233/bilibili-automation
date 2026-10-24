@@ -30,3 +30,10 @@ __pycache__/
 .venv/
 venv/
 node_modules/
+
+# Douyin reference clones (read-only, not part of the Android APK)
+/TikTokDownloader/
+/bytedance-nomark/
+/Douyin_TikTok_Download_API/
+/douyin-skills/
+/social-auto-upload/
